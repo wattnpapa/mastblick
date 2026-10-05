@@ -1,0 +1,27 @@
+# Beispiel für nginx: Kartenseite statisch, API und Push an mastblick-api.
+# Die Seite zeigt Standorte – schütze sie (Basic Auth, SSO o. Ä.). /api/owntracks hat eigene Basic Auth für die App
+# und muss für das Handy erreichbar bleiben (ggf. von der vorgeschalteten Anmeldung ausnehmen).
+server {
+    listen 443 ssl;
+    server_name karte.example.org;
+    # ssl_certificate …; ssl_certificate_key …;
+
+    root /opt/mastblick/web;
+    index index.html;
+
+    location = /api/mast/stream {              # Server-Sent Events: nicht puffern, lange offen halten
+        proxy_pass http://127.0.0.1:8091;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+    location /api/mast {
+        proxy_pass http://127.0.0.1:8091;
+        client_max_body_size 64k;
+    }
+    location = /api/owntracks {
+        proxy_pass http://127.0.0.1:8091;
+        proxy_set_header Authorization $http_authorization;
+        client_max_body_size 64k;
+    }
+}

@@ -1,0 +1,39 @@
+# mastblick – Beispielkonfiguration, nach /etc/mastblick/config.toml kopieren und anpassen.
+# Alles, was hier fehlt, nimmt mastblick aus den Standardwerten (lib/mastblick/konfig.py).
+
+[box]
+# FRITZ!Box mit LTE, vom Server aus erreichbar (gleiches Netz oder über einen Tunnel)
+adresse = "192.168.178.1"
+tr064_port = 49000
+# netrc-Datei mit den Zugangsdaten eines eigenen FRITZ!Box-Benutzers:
+#   machine 192.168.178.1 login <benutzer> password <kennwort>
+# Rechte: root:mastblick, 640
+netrc = "/etc/mastblick/fritzbox.netrc"
+
+[tunnel]
+# optional: WireGuard-Tunnel zur Box – liefert Handshake-Alter und Datenmenge durch den Tunnel
+wg_schnittstelle = ""     # z. B. "wg0"
+wg_peer = ""              # AllowedIP des Box-Peers, z. B. "10.0.0.4/32"
+
+[daten]
+verzeichnis = "/var/lib/mastblick"
+aufbewahren_tage = 90
+
+[api]
+adresse = "127.0.0.1"
+port = 8091
+# OwnTracks-Zugang: eine Zeile "<benutzer>:<sha256-hex des Kennworts>" (siehe README)
+owntracks_auth = "/etc/mastblick/owntracks.auth"
+# Kartenseite direkt von der API ausliefern (ohne Webserver, z. B. im Heimnetz); leer = nur API
+web_verzeichnis = ""
+# weitere JSON-Dateien, die bei Änderung per Push an offene Seiten gehen
+# push_dateien = { meine_daten = "/var/www/meine-daten.json" }
+
+[melden]
+# Messpaare (Handy-GPS + Zellen) an freie Datenbanken melden. Standard: aus.
+# Nur einschalten, wenn du einverstanden bist: deine gefahrenen Positionen samt Zellmessungen landen dort und sind öffentlich.
+beacondb = false
+opencellid = false
+# API-Schlüssel von opencellid.org, eine Zeile; wird auch zum Nachschlagen genutzt, wenn vorhanden
+opencellid_schluessel = "/etc/mastblick/opencellid.key"
+user_agent = "mastblick/0.1 (+https://github.com/wattnpapa/mastblick)"

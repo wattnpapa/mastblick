@@ -1,0 +1,15 @@
+[Unit]
+Description=mastblick: Zelldatenbank lernen, Gütewerte rechnen, optional an BeaconDB/OpenCelliD melden
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mastblick
+Group=mastblick
+ExecStart=/opt/mastblick/bin/mastblick-melden
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mastblick

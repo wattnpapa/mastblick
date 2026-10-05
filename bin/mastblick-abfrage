@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# mastblick-abfrage: verortet eine FRITZ!Box mit LTE grob über ihre Mobilfunkzelle.
+# 1. TR-064 X_AVM-DE_WANMobileConnection#GetInfoEx liefert alle sichtbaren Zellen (Zugangsdaten in einer netrc-Datei)
+#    Cellid und TAC kommen hexadezimal: "06258-15" → eNB 0x06258, Sektor 0x15, ECI 0x625815
+# 2. Ort: eigene Zelldatenbank (aus Handy-GPS gelernt) vor eigener Mastdatenbank vor BeaconDB/OpenCelliD
+# 3. Ergebnis nach <daten>/status.json (Karte), jede Abfrage in die SQLite-Datenbank
+# Läuft als Dienst (--loop): alle 60 s, alle 10 s bei Handy-Tracking oder Mitschreiben im Browser
+# (mastblick-api berührt dann <daten>/aufnahme), sofort nach Änderung von masten.json.
+# Jede Abfrage pingt die Box einmal an (Latenzkarte), liest optional Handshake/Zähler des WireGuard-Tunnels und
+# die Datenzähler der Box; bei aktivem Tracking landen auch Fehlschläge in der Datenbank (Funkloch-/Abbruchkarte).
+# "boot" = Einschaltzeit der Box (Uptime): hängt die Box im Auto, ist eine Einschaltung eine Fahrt.
+import json, math, os, re, html, subprocess, time, urllib.request, urllib.error
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "..", "lib")))
+from mastblick import db, konfig
+
+K = konfig.K
+NETRC = K["box"]["netrc"]
+URL = konfig.box_url("/upnp/control/x_wanmobileconn")
+SVC = "urn:dslforum-org:service:X_AVM-DE_WANMobileConnection:1"
+OUT = konfig.datei("status.json")     # aktueller Stand für die Karte (liefert mastblick-api unter /api/mast/status)
+CACHE = konfig.datei("cache.json")    # Lookup je Zellsatz, damit BeaconDB nicht bei jeder Abfrage gefragt wird
+AUFNAHME = konfig.datei("aufnahme")
+TRACKING = konfig.datei("tracking.json")  # Schalter Handy-Tracking (mastblick-api)
+MASTEN = konfig.datei("masten.json")  # eigene Mastdatenbank, Schlüssel "<PLMN>:<eNB>" oder "<PLMN>:<eNB>:<Sektor>" (Sektor hat Vorrang)
+ZELLEN = konfig.datei("zellen.json")  # eigene Zelldatenbank (mastblick-melden lernt sie aus Handy-GPS)
+CACHE_TTL = 6 * 3600
+TA_FAKTOR = 1.2                     # echter Abstand ≈ 1,2 × Abstand laut FRITZ!Box (Auswertung mit Handy-GPS)
+MIN_ANZAHL = 3                      # ab so vielen eigenen Messungen gilt der Schwerpunkt
+V_MAX = 50                          # m/s: schneller kann die Box nicht unterwegs sein
+HALTEN_MAX_S = 300                  # einen unplausiblen Sprung höchstens so lange ignorieren
+PP_FENSTER_S = 120                  # Ping-Pong: ≥ 2 Wechsel zwischen genau zwei Zellen in diesem Fenster
+OCID_KEY = K["melden"]["opencellid_schluessel"]   # auch zum Nachschlagen genutzt, wenn vorhanden
+BOX_IP = K["box"]["adresse"]
+WG_IF = K["tunnel"]["wg_schnittstelle"]
+WG_PEER_IP = K["tunnel"]["wg_peer"]
+
+
+def tr064():
+    body = ('<?xml version="1.0" encoding="utf-8"?><s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
+            'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            f'<u:GetInfoEx xmlns:u="{SVC}"></u:GetInfoEx></s:Body></s:Envelope>')
+    # Body muss inline (-d) übergeben werden: über stdin fehlt er beim zweiten, angemeldeten Durchgang
+    r = subprocess.run(["curl", "-s", "-m", "15", "--anyauth", "--netrc-file", NETRC, URL,
+                        "-H", 'Content-Type: text/xml; charset="utf-8"', "-H", f"SoapAction: {SVC}#GetInfoEx",
+                        "-d", body], capture_output=True, text=True, timeout=30)
+    x = r.stdout
+    if "GetInfoExResponse" not in x:
+        raise RuntimeError("FRITZ!Box nicht erreichbar oder Fehler: " + (re.sub(r"\s+", " ", x)[:200] or "keine Antwort"))
+    f = dict(re.findall(r"<(New\w+)>(.*?)</\1>", x, re.S))
+    cells = []
+    for c in re.findall(r"<Cell>(.*?)</Cell>", html.unescape(f.get("NewCellList", "")), re.S):
+        d = dict(re.findall(r"<(\w+)>(.*?)</\1>", c, re.S))
+        try:
+            enb, sec = d["Cellid"].split("-")
+            cells.append({
+                "verbunden": d.get("Connected", "none"), "typ": d.get("CellType"), "plmn": d.get("PLMN"),
+                "tac": int(d["TAC"], 16), "eci": int(enb + sec, 16), "enb": int(enb, 16), "sektor": int(sec, 16),
+                "cellid": d["Cellid"], "pci": int(d.get("PhysicalId") or 0), "distanz_m": int(d.get("Distance") or 0),
+                "rsrp": int(d.get("RSRP") or 0), "rsrq": int(d.get("Rsrq") or 0)})
+        except (KeyError, ValueError):
+            continue
+    cells.sort(key=lambda c: c["verbunden"] != "primary")
+    return {"technik": f.get("NewCurrentAccessTechnology"), "rsrp_antennen": f.get("NewSignalRSRP0"), "zellen": cells}
+
+
+def beacondb(cells):
+    towers = []
+    for c in cells:
+        if c["typ"] != "lte" or not c["plmn"]:
+            continue
+        t = {"radioType": "lte", "mobileCountryCode": int(c["plmn"][:3]), "mobileNetworkCode": int(c["plmn"][3:]),
+             "locationAreaCode": c["tac"], "cellId": c["eci"], "signalStrength": c["rsrp"]}
+        if c["verbunden"] == "primary":
+            t["serving"] = 1
+        towers.append(t)
+    if not towers:
+        return None
+    req = urllib.request.Request("https://api.beacondb.net/v1/geolocate",
+                                 data=json.dumps({"considerIp": False, "fallbacks": {"lacf": True, "ipf": False},
+                                                  "cellTowers": towers}).encode(),
+                                 headers={"Content-Type": "application/json", "User-Agent": K["melden"]["user_agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.load(r)
+        return {"lat": d["location"]["lat"], "lng": d["location"]["lng"], "genauigkeit_m": round(d["accuracy"]),
+                "quelle": "BeaconDB"}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"lat": None, "lng": None, "genauigkeit_m": None, "quelle": "BeaconDB: Zelle unbekannt"}
+        raise
+
+
+def opencellid(c):
+    """Zweite Quelle: OpenCelliD für die primäre Zelle (nur mit API-Schlüssel, siehe [melden] opencellid_schluessel)."""
+    if not c or c.get("typ") != "lte" or not os.path.exists(OCID_KEY):
+        return None
+    key = open(OCID_KEY).read().strip()
+    url = (f"https://opencellid.org/cell/get?key={key}&mcc={c['plmn'][:3]}&mnc={int(c['plmn'][3:])}"
+           f"&lac={c['tac']}&cellid={c['eci']}&radio=LTE&format=json")
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": K["melden"]["user_agent"]}), timeout=20) as r:
+        d = json.load(r)
+    if not d.get("lat"):
+        return None
+    return {"lat": d["lat"], "lng": d["lon"], "genauigkeit_m": round(d.get("range") or 5000), "quelle": "OpenCelliD"}
+
+
+def load(p, default):
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, d):
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, p)
+
+
+BOOT = {"t": None, "abgefragt": 0}   # Einschaltzeit der Box (jetzt − Uptime): Box im Auto, eine Einschaltung = eine Fahrt
+
+
+def einschaltzeit():
+    """Einschaltzeitpunkt der Box über TR-064 DeviceInfo#GetInfo (NewUpTime), alle 10 min neu, sonst gemerkt."""
+    if BOOT["t"] and time.time() - BOOT["abgefragt"] < 600:
+        return BOOT["t"]
+    svc = "urn:dslforum-org:service:DeviceInfo:1"
+    body = ('<?xml version="1.0" encoding="utf-8"?><s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
+            'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            f'<u:GetInfo xmlns:u="{svc}"></u:GetInfo></s:Body></s:Envelope>')
+    try:
+        x = subprocess.run(["curl", "-s", "-m", "10", "--anyauth", "--netrc-file", NETRC, konfig.box_url("/upnp/control/deviceinfo"),
+                            "-H", 'Content-Type: text/xml; charset="utf-8"', "-H", f"SoapAction: {svc}#GetInfo", "-d", body],
+                           capture_output=True, text=True, timeout=20).stdout
+        m = re.search(r"<NewUpTime>(\d+)</NewUpTime>", x)
+    except (OSError, subprocess.SubprocessError):
+        m = None
+    if not m:
+        return None
+    t = int(time.time()) - int(m.group(1))
+    # kleine Schwankungen (Abfragedauer) nicht als neue Einschaltung werten
+    BOOT.update(t=BOOT["t"] if BOOT["t"] and abs(BOOT["t"] - t) < 60 else t, abgefragt=time.time())
+    return BOOT["t"]
+
+
+def soap(pfad, svc, aktion):
+    """Einfacher TR-064-Aufruf ohne Argumente, liefert {NewXyz: Wert} oder {} bei Fehler/fehlendem Recht."""
+    body = ('<?xml version="1.0" encoding="utf-8"?><s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
+            'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            f'<u:{aktion} xmlns:u="{svc}"></u:{aktion}></s:Body></s:Envelope>')
+    try:
+        x = subprocess.run(["curl", "-s", "-m", "10", "--anyauth", "--netrc-file", NETRC, konfig.box_url(pfad),
+                            "-H", 'Content-Type: text/xml; charset="utf-8"', "-H", f"SoapAction: {svc}#{aktion}", "-d", body],
+                           capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return dict(re.findall(r"<(New[\w-]+)>(.*?)</\1>", x, re.S)) if f"{aktion}Response" in x else {}
+
+
+def box_bytes():
+    """Datenmenge über das Mobilfunk-WAN der Box seit dem Einschalten (64-bit-Zähler, sonst 32-bit), (rx, tx) oder None."""
+    svc = "urn:dslforum-org:service:WANCommonInterfaceConfig:1"
+    a = soap("/upnp/control/wancommonifconfig1", svc, "X_AVM-DE_GetOnlineMonitor")
+    rx, tx = a.get("NewTotal64BytesReceived") or a.get("NewX_AVM_DE_TotalBytesReceived64"), a.get("NewTotal64BytesSent") or a.get("NewX_AVM_DE_TotalBytesSent64")
+    if not (rx and tx):
+        r, s = soap("/upnp/control/wancommonifconfig1", svc, "GetTotalBytesReceived"), soap("/upnp/control/wancommonifconfig1", svc, "GetTotalBytesSent")
+        rx, tx = r.get("NewTotalBytesReceived"), s.get("NewTotalBytesSent")
+    try:
+        return int(rx), int(tx)
+    except (TypeError, ValueError):
+        return None
+
+
+def ping_ms():
+    """Ein Ping an die Box durch den Tunnel, Laufzeit in ms oder None."""
+    try:
+        o = subprocess.run(["ping", "-c", "1", "-W", "2", "-q", BOX_IP], capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"= ([\d.]+)/", o)
+        return round(float(m.group(1)), 1) if m else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def wg_info():
+    """(Sekunden seit letztem Handshake, Bytes empfangen, Bytes gesendet) des Box-Peers aus Sicht des Servers."""
+    if not (WG_IF and WG_PEER_IP):
+        return None, None, None
+    try:
+        for line in subprocess.check_output(["wg", "show", WG_IF, "dump"], text=True, timeout=5).splitlines()[1:]:
+            f = line.split("\t")
+            if WG_PEER_IP in f[3].split(","):
+                return (int(time.time()) - int(f[4]) if int(f[4]) else None), int(f[5]), int(f[6])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+    return None, None, None
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    now = int(time.time())
+    last = load(OUT, {})
+    rtt, (wg, wg_rx, wg_tx) = ping_ms(), wg_info()
+    try:
+        info = tr064()
+    except Exception as e:
+        # Box aus oder Tunnel weg: letzten Ort behalten, als veraltet markieren
+        if last.get("ok", True):
+            print("Fehler:", e, flush=True)
+        last.update({"ok": False, "fehler": str(e), "abgefragt": now})
+        write_json(OUT, last)
+        BOOT["abgefragt"] = 0   # nach dem nächsten Einschalten neu fragen
+        if aktiv():
+            # nur mit Handy-GPS auswertbar, sonst füllt eine ausgeschaltete Box die Datei
+            db.fehler_schreiben(now, str(e)[:120], rtt, wg)
+        return
+    key = ",".join(f'{c["tac"]}:{c["eci"]}' for c in info["zellen"])
+    cache = load(CACHE, {})
+    hit = cache.get(key)
+    prim = info["zellen"][0] if info["zellen"] else {}
+    masten = load(MASTEN, {})
+    base = f'{prim.get("plmn")}:{prim.get("enb")}'
+    mast = masten.get(f'{base}:{prim.get("sektor")}') or masten.get(base)
+    eigen = load(ZELLEN, {}).get(f'{base}:{prim.get("sektor")}')
+    if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
+        # eigene Messungen: Schwerpunkt der GPS-Positionen, an denen die Box mit dieser Zelle verbunden war
+        geo = {"lat": eigen["lat"], "lng": eigen["lng"], "genauigkeit_m": eigen["streuung_m"], "quelle": "eigene Zelldaten",
+               "anzahl": eigen["anzahl"]}
+    elif mast:
+        # Mast bekannt: Box liegt auf einem Ring mit dem gemeldeten Abstand (Timing Advance) um den Mast
+        geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((prim.get("distanz_m") or 230) * TA_FAKTOR),
+               "quelle": "Mastdatenbank", "mast": True, "enb": prim.get("enb"), "distanz_m": prim.get("distanz_m"),
+               "sektor": prim.get("sektor") if f'{base}:{prim.get("sektor")}' in masten else None}
+    elif hit and now - hit["zeit"] < CACHE_TTL:
+        geo = hit["geo"]
+    else:
+        kand = []
+        for name, fn in (("BeaconDB", lambda: beacondb(info["zellen"])), ("OpenCelliD", lambda: opencellid(prim))):
+            try:
+                g = fn()
+                if g:
+                    kand.append(g)
+            except Exception as e:
+                print(name, "nicht erreichbar:", str(e).replace(open(OCID_KEY).read().strip() if os.path.exists(OCID_KEY) else "\0", "<key>"), flush=True)
+        treffer = [g for g in kand if g.get("lat") is not None]
+        geo = min(treffer, key=lambda g: g["genauigkeit_m"]) if treffer else (kand[0] if kand else last.get("geo"))
+        if kand:
+            cache[key] = {"zeit": now, "geo": geo}
+            cache = {k: v for k, v in cache.items() if now - v["zeit"] < 7 * 86400}
+            write_json(CACHE, cache)
+    # Ping-Pong-Glättung: springt die Box binnen PP_FENSTER_S nur zwischen zwei Zellen hin und her (Hälfte aller
+    # Zellwechsel bei Testfahrten), liegt sie zwischen beiden → Mittelpunkt statt Hin- und Herspringen
+    kurz = [k for k in last.get("kurz", []) if now - k[0] <= PP_FENSTER_S] if last.get("ok") else []
+    zk = f'{base}:{prim.get("sektor")}'
+    if geo and geo.get("lat") is not None:
+        kurz.append([now, zk, geo["lat"], geo["lng"], geo.get("genauigkeit_m") or 1000])
+    wechsel = sum(1 for a, b in zip(kurz, kurz[1:]) if a[1] != b[1])
+    zellen_kurz = {k[1]: k for k in kurz}   # je Zelle die jüngste Position
+    if wechsel >= 2 and len(zellen_kurz) == 2:
+        a, b = zellen_kurz.values()
+        d = math.hypot((a[3] - b[3]) * 111320 * math.cos(math.radians(a[2])), (a[2] - b[2]) * 110540)
+        geo = {**geo, "lat": round((a[2] + b[2]) / 2, 6), "lng": round((a[3] + b[3]) / 2, 6),
+               "genauigkeit_m": round(max(a[4], b[4]) + d / 2), "pingpong": [a[1], b[1]]}
+    # Plausibilität: Sprung weiter als seit dem letzten angenommenen Ort fahrbar und die neue Quelle ist nur eine fremde
+    # Schätzung → alten Ort halten. Fahrbare Strecke ab ort_seit rechnen, nicht ab der letzten Abfrage: sonst gilt beim
+    # Fahren jede neue Schätzung als Sprung und der Ort klebt jeweils HALTEN_MAX_S fest (bei einer Testfahrt bis 10 km daneben).
+    lg = last.get("geo") or {}
+    if (geo and geo.get("lat") is not None and lg.get("lat") is not None and last.get("ok")
+            and geo.get("quelle") in ("BeaconDB", "OpenCelliD") and now - last.get("abgefragt", now) < 600):
+        sprung = math.hypot((geo["lng"] - lg["lng"]) * 111320 * math.cos(math.radians(lg["lat"])), (geo["lat"] - lg["lat"]) * 110540)
+        erlaubt = (V_MAX * max(10, now - last.get("ort_seit", now)) + 500
+                   + min(lg.get("genauigkeit_m") or 0, 2000) + min(geo.get("genauigkeit_m") or 0, 2000))
+        if sprung > erlaubt and now - last.get("ort_seit", now) < HALTEN_MAX_S:
+            geo = {**{k: v for k, v in lg.items() if k not in ("verworfen", "gehalten")}, "gehalten": True,
+                   "verworfen": {"quelle": geo["quelle"], "sprung_m": round(sprung)}}
+    p = prim
+    out = {"ok": True, "fehler": None, "abgefragt": now, "technik": info["technik"],
+           "rsrp_antennen": info["rsrp_antennen"], "zellen": info["zellen"], "geo": geo, "kurz": kurz[-30:]}
+    # beim Halten zählt die Haltezeit ab dem letzten angenommenen Ort weiter (sonst liefe HALTEN_MAX_S nie ab)
+    out["ort_seit"] = last.get("ort_seit", now) if (last.get("geo") == geo or (geo or {}).get("gehalten")) else now
+    write_json(OUT, out)
+    # Datenmengen: box = Mobilfunk-WAN der Box seit Einschalten, wg = Tunnel-Zähler am Server
+    db.abfrage_schreiben(now, info["technik"], info["zellen"], rtt, wg, einschaltzeit(), box_bytes(),
+                              [wg_rx, wg_tx] if wg_rx is not None else None, geo)
+    if not last.get("ok") or (last.get("zellen") or [{}])[0].get("cellid") != p.get("cellid"):
+        print(json.dumps({"zelle": p.get("cellid"), "tac": p.get("tac"), "geo": geo}, ensure_ascii=False), flush=True)
+
+
+def mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return 0
+
+
+def aktiv():
+    """Schnell abfragen (10 s), solange das Handy-Tracking an ist oder GPS-Punkte ankommen."""
+    return time.time() - mtime(AUFNAHME) < 120 or load(TRACKING, {}).get("an", False)
+
+
+def loop():
+    seen = mtime(MASTEN)
+    while True:
+        t0 = time.time()
+        try:
+            main()
+        except Exception as e:
+            print("Fehler:", e, flush=True)
+        while True:
+            time.sleep(1)
+            if mtime(MASTEN) != seen:
+                seen = mtime(MASTEN)
+                break
+            if time.time() - t0 >= (10 if aktiv() else 60):
+                break
+
+
+if __name__ == "__main__":
+    import sys
+    loop() if "--loop" in sys.argv else main()

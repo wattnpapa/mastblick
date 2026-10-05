@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# mastblick-melden (Timer alle 15 min):
+# 1. lernt die eigene Zelldatenbank: GPS-Schwerpunkt und Streuung je primärer Zelle (zellen.json)
+# 2. rechnet die Ortungsgüte, die nur mit freien Daten (BeaconDB/OpenCelliD) möglich wäre (frei.json, Gütekurve)
+# 3. meldet Messpaare an BeaconDB und/oder OpenCelliD – nur wenn in config.toml [melden] eingeschaltet
+# Paar = Zellmessung, deren Zeitpunkt zwischen zwei GPS-Punkten liegt, die höchstens 20 s auseinander und ≤ 50 m
+# genau sind; die Position wird linear dazwischen interpoliert. Gemeldet werden alle LTE-Zellen der Messung mit
+# RSRP und PCI, kein Timing Advance (Umrechnung der FRITZ!Box unklar). Stillstand wird nicht mehrfach gemeldet.
+# Stand in <daten>/melden.json; räumt zum Schluss alles älter als [daten] aufbewahren_tage aus der Datenbank.
+import csv, io, json, os, time, urllib.request, urllib.error, uuid
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "..", "lib")))
+from mastblick import db, konfig
+
+K = konfig.K
+STATE = konfig.DATEN
+STAND = konfig.datei("melden.json")
+ZELLEN = konfig.datei("zellen.json")    # eigene Zell-Datenbank: GPS-Schwerpunkt je primärer Zelle (PLMN:eNB:Sektor)
+OCID_KEY = K["melden"]["opencellid_schluessel"]
+UA = K["melden"]["user_agent"]
+MAX_LUECKE_S = 20
+MAX_GENAU_M = 50
+KEEP_DAYS = K["daten"]["aufbewahren_tage"]
+
+def load(p, d):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return d
+
+
+def gps_punkte():
+    return [(t / 1000, la, ln, 999 if acc is None else acc, sp, hd) for t, la, ln, acc, sp, hd, q in db.gps()]
+
+
+def position(pts, t):
+    """GPS-Position zum Zeitpunkt t (Sekunden), linear interpoliert; None ohne passende Nachbarn."""
+    if not pts or t < pts[0][0] or t > pts[-1][0]:
+        return None
+    lo, hi = 0, len(pts) - 1
+    while lo < hi - 1:
+        m = (lo + hi) // 2
+        if pts[m][0] <= t:
+            lo = m
+        else:
+            hi = m
+    a, b = pts[lo], pts[hi]
+    if b[0] - a[0] > MAX_LUECKE_S or max(a[3], b[3]) > MAX_GENAU_M:
+        return None
+    f = 0 if b[0] == a[0] else (t - a[0]) / (b[0] - a[0])
+    return {"lat": a[1] + f * (b[1] - a[1]), "lng": a[2] + f * (b[2] - a[2]), "acc": max(a[3], b[3]),
+            "speed": a[4] if a[4] is not None else b[4], "heading": a[5] if a[5] is not None else b[5]}
+
+
+def paare(seit):
+    pts = gps_punkte()
+    out = []
+    for m in db.messungen(seit):
+        pos = position(pts, m["t"])
+        cells = [c for c in m.get("zellen", []) if c.get("typ") == "lte" and c.get("plmn")]
+        if pos and cells:
+            out.append((m["t"], pos, cells))
+    return out
+
+
+def ohne_stillstand(pp):
+    """Stillstand nicht mehrfach melden: Paar überspringen, wenn die Position < 15 m vom zuletzt gemeldeten Paar liegt
+    und dieselbe Primärzelle gilt. OpenCelliD zählt solche Zeilen sonst als Duplikate."""
+    import math
+    out, vor = [], None
+    for t, pos, cells in pp:
+        prim = next((c["eci"] for c in cells if c.get("verbunden") == "primary"), None)
+        if vor and prim == vor[2] and math.hypot((pos["lng"] - vor[1]) * 111320 * math.cos(math.radians(pos["lat"])),
+                                                 (pos["lat"] - vor[0]) * 110540) < 15:
+            continue
+        out.append((t, pos, cells))
+        vor = (pos["lat"], pos["lng"], prim)
+    return out
+
+
+def beacondb(pp):
+    items = []
+    for t, pos, cells in pp:
+        p = {"latitude": round(pos["lat"], 6), "longitude": round(pos["lng"], 6), "accuracy": round(pos["acc"]), "source": "gps"}
+        if pos["speed"] is not None:
+            p["speed"] = pos["speed"]
+        if pos["heading"] is not None:
+            p["heading"] = pos["heading"]
+        items.append({"timestamp": int(t * 1000), "position": p, "cellTowers": [
+            {"radioType": "lte", "mobileCountryCode": int(c["plmn"][:3]), "mobileNetworkCode": int(c["plmn"][3:]),
+             "locationAreaCode": c["tac"], "cellId": c["eci"], "primaryScramblingCode": c["pci"],
+             "signalStrength": c["rsrp"], "serving": 1 if c["verbunden"] == "primary" else 0} for c in cells]})
+    for i in range(0, len(items), 100):
+        req = urllib.request.Request("https://api.beacondb.net/v2/geosubmit", data=json.dumps({"items": items[i:i + 100]}).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if r.status >= 300:
+                raise RuntimeError(f"BeaconDB HTTP {r.status}")
+    return None
+
+
+def opencellid(pp, key):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["mcc", "mnc", "lac", "cellid", "lon", "lat", "signal", "measured_at", "rating", "speed", "direction", "act", "pci"])
+    for t, pos, cells in pp:
+        for c in cells:
+            w.writerow([c["plmn"][:3], int(c["plmn"][3:]), c["tac"], c["eci"], round(pos["lng"], 6), round(pos["lat"], 6), c["rsrp"],
+                        int(t * 1000), round(pos["acc"]), pos["speed"] if pos["speed"] is not None else "",
+                        pos["heading"] if pos["heading"] is not None else "", "LTE", c["pci"]])
+    bnd = uuid.uuid4().hex
+    body = (f'--{bnd}\r\nContent-Disposition: form-data; name="key"\r\n\r\n{key}\r\n'
+            f'--{bnd}\r\nContent-Disposition: form-data; name="datafile"; filename="messungen.csv"\r\nContent-Type: text/csv\r\n\r\n'
+            f'{buf.getvalue()}\r\n--{bnd}--\r\n').encode()
+    req = urllib.request.Request("https://opencellid.org/measure/uploadCsv", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={bnd}", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        antwort = r.read().decode(errors="replace")[:300]
+    if "error" in antwort.lower() or "invalid" in antwort.lower():
+        raise RuntimeError("OpenCelliD: " + antwort)
+    return antwort.strip()
+
+
+FREI = STATE + "/frei.json"           # Ortungsgüte nur mit freien Daten je Fahrt + Tagesverlauf (für die Gütekurve)
+FREI_CACHE = STATE + "/frei-cache.json"
+FREI_TTL = 20 * 3600                  # Zellpositionen 1×/Tag neu holen: zeigt, ob unsere Meldungen dort ankommen
+
+
+def frei_nachschlagen(z, cache, key):
+    """BeaconDB (ohne Flächen-Rückfall) und OpenCelliD für eine Zelle, [lat, lng] oder None, mit Cache."""
+    k = f'{z["plmn"]}:{z["eci"]}'
+    c = cache.get(k)
+    if c and time.time() - c["t"] < FREI_TTL:
+        return c
+    c = {"t": int(time.time()), "bdb": None, "ocid": None}
+    body = {"considerIp": False, "fallbacks": {"lacf": False, "ipf": False}, "cellTowers": [
+        {"radioType": "lte", "mobileCountryCode": int(z["plmn"][:3]), "mobileNetworkCode": int(z["plmn"][3:]),
+         "locationAreaCode": z["tac"], "cellId": z["eci"]}]}
+    try:
+        req = urllib.request.Request("https://api.beacondb.net/v1/geolocate", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.load(r)
+        c["bdb"] = [d["location"]["lat"], d["location"]["lng"], round(d.get("accuracy") or 0)]
+    except urllib.error.HTTPError:
+        pass
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return c if not cache.get(k) else cache[k]   # Netzfehler: alten Stand behalten
+    if key:
+        try:
+            url = (f"https://opencellid.org/cell/get?key={key}&mcc={z['plmn'][:3]}&mnc={int(z['plmn'][3:])}"
+                   f"&lac={z['tac']}&cellid={z['eci']}&radio=LTE&format=json")
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20) as r:
+                d = json.load(r)
+            if d.get("lat"):
+                c["ocid"] = [d["lat"], d["lon"], round(d.get("range") or 0)]
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    cache[k] = c
+    time.sleep(0.3)
+    return c
+
+
+def frei_guete(key):
+    """Ortungsfehler gegen Handy-GPS je Fahrt, wenn nur BeaconDB bzw. OpenCelliD (heutiger Stand) für die
+    primäre Zelle genutzt würden. Dazu je Tag der Gesamt-Median, um zu sehen, ob die freien Daten besser werden."""
+    import math
+    cache = load(FREI_CACHE, {})
+    def fehler(pos, g):
+        return math.hypot((g[1] - pos["lng"]) * 111320 * math.cos(math.radians(pos["lat"])), (g[0] - pos["lat"]) * 110540)
+    fahrten, vor, alle = [], None, {"bdb": [], "ocid": []}
+    for t, pos, cells in paare(0):
+        z = next((c for c in cells if c.get("verbunden") == "primary"), None)
+        if not z:
+            continue
+        if vor is None or t - vor > 300:
+            fahrten.append({"von": int(t), "bis": int(t), "bdb": [], "ocid": []})
+        vor = t
+        f = fahrten[-1]; f["bis"] = int(t)
+        c = frei_nachschlagen(z, cache, key)
+        for q in ("bdb", "ocid"):
+            if c.get(q):
+                f[q].append(fehler(pos, c[q])); alle[q].append(f[q][-1])
+    def kurz(v):
+        v = sorted(v)
+        return {"n": len(v), "median": round(v[len(v) // 2]), "p90": round(v[int(len(v) * .9)])} if v else {"n": 0, "median": None, "p90": None}
+    alt = load(FREI, {})
+    verlauf = {**alt.get("verlauf", {}), time.strftime("%Y-%m-%d"): {q: kurz(alle[q])["median"] for q in alle}}
+    out = {"stand": int(time.time()), "fahrten": [{"von": f["von"], "bis": f["bis"], "bdb": kurz(f["bdb"]), "ocid": kurz(f["ocid"])}
+                                                  for f in fahrten], "verlauf": dict(sorted(verlauf.items())[-120:])}
+    for p, d in ((FREI_CACHE, cache), (FREI, out)):
+        with open(p + ".tmp", "w") as fh:
+            json.dump(d, fh)
+        os.chmod(p + ".tmp", 0o644)
+        os.replace(p + ".tmp", p)
+    return out
+
+
+def aufraeumen():
+    """Abfragen, Zellen und GPS-Punkte älter als 90 Tage aus der Datenbank löschen."""
+    db.aufraeumen(KEEP_DAYS)
+
+
+def lernen():
+    """Für jede Zelle (als primäre Zelle der Box) Schwerpunkt und Streuung der zugehörigen GPS-Positionen.
+    Ortet in der Praxis deutlich besser als Mast-Position, BeaconDB und OpenCelliD (siehe Gütekurve)."""
+    import math, statistics
+    pos = {}
+    for t, p, cells in paare(0):
+        c = next((z for z in cells if z.get("verbunden") == "primary"), None)
+        if c:
+            pos.setdefault(f'{c["plmn"]}:{c["enb"]}:{c["sektor"]}', []).append((p["lat"], p["lng"], t))
+    out = {}
+    for k, v in pos.items():
+        la, lo = statistics.mean(x[0] for x in v), statistics.mean(x[1] for x in v)
+        d = sorted(math.hypot((x[1] - lo) * 111320 * math.cos(math.radians(la)), (x[0] - la) * 110540) for x in v)
+        out[k] = {"lat": round(la, 6), "lng": round(lo, 6), "streuung_m": max(100, round(d[int(len(d) * .75)])),
+                  "anzahl": len(v), "zuletzt": int(max(x[2] for x in v))}
+    with open(ZELLEN + ".tmp", "w") as f:
+        json.dump(out, f, indent=1)
+    os.chmod(ZELLEN + ".tmp", 0o644)
+    os.replace(ZELLEN + ".tmp", ZELLEN)
+    return len(out)
+
+
+def main():
+    try:
+        print(f"lernen: {lernen()} Zellen in zellen.json", flush=True)
+    except Exception as e:
+        print("lernen: Fehler", e, flush=True)
+    stand = load(STAND, {})
+    key = open(OCID_KEY).read().strip() if os.path.exists(OCID_KEY) else None
+    try:
+        fr = frei_guete(key)
+        print("frei: " + ", ".join(f'{q} Median {v} m' for q, v in fr["verlauf"][max(fr["verlauf"])].items()), flush=True)
+    except Exception as e:
+        print("frei: Fehler", str(e).replace(key or "\0", "<key>"), flush=True)
+    for ziel in ("beacondb", "opencellid"):
+        if not K["melden"][ziel] or (ziel == "opencellid" and not key):
+            continue
+        seit = stand.get(ziel, {}).get("bis", 0)
+        alle = paare(seit)
+        if not alle:
+            continue
+        pp = ohne_stillstand(alle) or alle[-1:]
+        try:
+            info = beacondb(pp) if ziel == "beacondb" else opencellid(pp, key)
+            stand[ziel] = {"bis": alle[-1][0], "zuletzt": int(time.time()),
+                           "gesamt": stand.get(ziel, {}).get("gesamt", 0) + len(pp), "fehler": None}
+            print(f"{ziel}: {len(pp)} Messpaare gemeldet" + (f" ({info})" if info else ""), flush=True)
+        except (urllib.error.URLError, RuntimeError, OSError) as e:
+            stand.setdefault(ziel, {})["fehler"] = str(e)[:300]
+            print(f"{ziel}: Fehler {e}", flush=True)
+    with open(STAND + ".tmp", "w") as f:
+        json.dump(stand, f, indent=1)
+    os.replace(STAND + ".tmp", STAND)
+    aufraeumen()
+
+
+if __name__ == "__main__":
+    main()

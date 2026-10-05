@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+# mastblick-api: HTTP-API für die Karte (Webserver leitet /api/mast und /api/owntracks hierher, lauscht nur lokal).
+# Daten im Datenverzeichnis (siehe config.toml):
+#   masten.json        eigene Mastdatenbank {"<PLMN>:<eNB>[:<Sektor>]": {lat, lng, quelle, notiz, erfasst}}
+#   beobachtungen.json Anlern-Punkte [{zeit, plmn, enb, distanz_m, rsrp, lat, lng, genauigkeit_m}]
+#   mastblick.db       Abfragen, Zellen, Handy-GPS (SQLite, lib/mastblick/db.py)
+# Anlernen: Ein Gerät im WLAN der FRITZ!Box schickt seine Browser-Position. Zusammen mit dem Abstand zum Mast,
+# den die Box meldet (Timing Advance), ergibt jede Beobachtung einen Ring um den Mast; ab 3 verteilten Ringen
+# wird der Mast per Ausgleichsrechnung bestimmt.
+# /api/mast/auswertung: Ortungsgüte, Funklöcher/Latenz, Versorgungsgebiete, Mast-Nachschärfen (auswertung()).
+# /api/owntracks: Handy-GPS von der OwnTracks-App (HTTP-Modus, Basic Auth), nur gespeichert, wenn Tracking an ist.
+import base64, hashlib, hmac, json, math, os, queue, threading, time
+from collections import defaultdict
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "..", "lib")))
+from mastblick import db, konfig
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+K = konfig.K
+STATE = konfig.DATEN
+GEO = konfig.datei("status.json")       # schreibt mastblick-abfrage
+MASTEN = konfig.datei("masten.json")
+OBS = konfig.datei("beobachtungen.json")
+TRACKING = konfig.datei("tracking.json")         # Schalter Handy-Tracking per OwnTracks {an, seit}, nur bewusst über die Webseite
+OT_LETZTE = konfig.datei("owntracks-letzte.json") # letzte Meldung der App {t, acc, modus, akku}
+TRACKING_MAX_S = 12 * 3600                        # Sicherheitsnetz: schaltet sich nach 12 h selbst aus
+STRECKEN = konfig.datei("strecken.json")  # von Hand nachgetragene Strecken [{name, quelle, punkte:[[zeit,lat,lng]]}], nur Anzeige, wird nicht gemeldet
+AUFNAHME = konfig.datei("aufnahme")     # mtime = letzte GPS-Meldung; mastblick-abfrage fragt dann alle 10 s ab
+MAX_GEO_ALTER = 600      # Zellinfo darf höchstens 10 min alt sein, sonst passt sie nicht zur Position
+MAX_GENAU = 150          # Browser-Position genauer als 150 m, sonst nutzlos
+MIN_STREUUNG = 100       # Beobachtungen müssen mindestens so weit auseinander liegen
+TA_FAKTOR = 1.2          # Abstand der FRITZ!Box ist zu kurz: echt ≈ 1,2 × gemeldet (Auswertung mit Handy-GPS)
+MAX_ABWEICHUNG = 400     # Ausgleichsrechnung mit größerem Restfehler gilt als unbrauchbar
+MAX_ENTFERNUNG = 15000   # Mast weiter als 15 km vom Schwerpunkt der Messpunkte: verwerfen
+VERWORFEN = konfig.datei("verworfen.json")   # abgelehnte Vorschläge (Schlüssel)
+OWNTRACKS_AUTH = K["api"]["owntracks_auth"]   # eine Zeile "<benutzer>:<sha256-hex des Kennworts>"
+GPS_LUECKE_S = 20
+GPS_GENAU_M = 50
+
+
+def load(p, d):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return d
+
+
+def save(p, d):
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o664)
+    os.replace(tmp, p)
+
+
+def zelle():
+    g = load(GEO, {})
+    z = (g.get("zellen") or [None])[0]
+    return g, z
+
+
+def enu(lat0, lng0, lat, lng):
+    return ((lng - lng0) * 111320 * math.cos(math.radians(lat0)), (lat - lat0) * 110540)
+
+
+def latlng(lat0, lng0, x, y):
+    return (lat0 + y / 110540, lng0 + x / (111320 * math.cos(math.radians(lat0))))
+
+
+def schaetzung(obs):
+    """Mastposition aus Ringen (Position, Abstand) per Gauss-Newton; None, wenn zu wenig oder zu eng beieinander."""
+    obs = [o for o in obs if o.get("distanz_m")]
+    if len(obs) < 3:
+        return None
+    lat0 = sum(o["lat"] for o in obs) / len(obs)
+    lng0 = sum(o["lng"] for o in obs) / len(obs)
+    pts = [(*enu(lat0, lng0, o["lat"], o["lng"]), o["distanz_m"] * TA_FAKTOR) for o in obs]
+    if max(math.hypot(a[0] - b[0], a[1] - b[1]) for a in pts for b in pts) < MIN_STREUUNG:
+        return None
+    best = None
+    # mehrere Startpunkte, weil zwei Lösungen (Spiegelung) möglich sind
+    for sx, sy in [(0, 0)] + [(300 * math.cos(a), 300 * math.sin(a)) for a in (0, 1.6, 3.1, 4.7)]:
+        x, y = sx, sy
+        for _ in range(50):
+            jtj = [[0, 0], [0, 0]]; jtr = [0, 0]
+            for px, py, d in pts:
+                r = math.hypot(x - px, y - py) or 1e-6
+                jx, jy, res = (x - px) / r, (y - py) / r, r - d
+                jtj[0][0] += jx * jx; jtj[0][1] += jx * jy; jtj[1][1] += jy * jy
+                jtr[0] += jx * res; jtr[1] += jy * res
+            det = jtj[0][0] * jtj[1][1] - jtj[0][1] ** 2
+            if abs(det) < 1e-9:
+                break
+            dx = (jtj[1][1] * jtr[0] - jtj[0][1] * jtr[1]) / det
+            dy = (jtj[0][0] * jtr[1] - jtj[0][1] * jtr[0]) / det
+            x, y = x - dx, y - dy
+            if math.hypot(dx, dy) < 0.5:
+                break
+        rms = math.sqrt(sum((math.hypot(x - px, y - py) - d) ** 2 for px, py, d in pts) / len(pts))
+        if best is None or rms < best[2]:
+            best = (x, y, rms)
+    if best[2] > MAX_ABWEICHUNG or math.hypot(best[0], best[1]) > MAX_ENTFERNUNG:
+        return None
+    # Liegen die Messpunkte fast auf einer Linie (gerade Straße), gibt es eine Spiegellösung auf der anderen Seite
+    mx = sum(p[0] for p in pts) / len(pts); my = sum(p[1] for p in pts) / len(pts)
+    sxx = sum((p[0] - mx) ** 2 for p in pts); syy = sum((p[1] - my) ** 2 for p in pts); sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    w = math.sqrt(((sxx - syy) / 2) ** 2 + sxy ** 2); l1 = (sxx + syy) / 2 + w; l2 = (sxx + syy) / 2 - w
+    lat, lng = latlng(lat0, lng0, best[0], best[1])
+    return {"lat": round(lat, 6), "lng": round(lng, 6), "rms_m": round(best[2]), "anzahl": len(pts),
+            "eindeutig": l1 > 0 and l2 / l1 > 0.05}
+
+
+def status():
+    g, z = zelle()
+    if not z:
+        return {"ok": False, "fehler": "keine Zellinfo der FRITZ!Box"}
+    key = f'{z["plmn"]}:{z["enb"]}'
+    skey = f'{key}:{z["sektor"]}'
+    # Anlernen je Sektor: Beobachtungen ohne Sektorangabe (alt) zählen für alle Sektoren der eNB
+    obs = [o for o in load(OBS, []) if f'{o["plmn"]}:{o["enb"]}' == key and o.get("sektor") in (None, z["sektor"])]
+    masten = load(MASTEN, {})
+    return {"ok": True, "zelle": z, "abgefragt": g.get("abgefragt"), "frisch": time.time() - g.get("abgefragt", 0) < MAX_GEO_ALTER,
+            "schluessel": key, "mast": masten.get(skey) or masten.get(key), "mast_ebene": "sektor" if skey in masten else "enb", "schaetzung_beacondb": None if (g.get("geo") or {}).get("mast") else g.get("geo"),
+            "beobachtungen": obs, "berechnet": schaetzung(obs)}
+
+
+def verlauf(ab, bis):
+    """Track der letzten Stunden aus der Datenbank (Abfragen mit primärer Zelle und angezeigtem Ort). Punkte mit inzwischen bekanntem Mast werden auf den Mast gesetzt.
+    Aufeinanderfolgende Punkte an derselben Zelle werden zusammengefasst (von/bis)."""
+    masten = load(MASTEN, {})
+    pkt, offen = [], {}
+    for c in db.verlauf(int(ab), int(bis)):
+        if len(c) < 12 or not c[0].isdigit() or int(c[0]) < ab or int(c[0]) > bis or not c[3].isdigit():
+            continue
+        zeit, plmn, eci = int(c[0]), c[1], int(c[3])
+        enb, key = eci >> 8, f"{plmn}:{eci >> 8}"
+        m = masten.get(f"{key}:{eci & 255}") or masten.get(key)
+        if m:
+            lat, lng, acc, q = m["lat"], m["lng"], int(c[8] or 0) or 300, "mast"
+        elif c[9] and c[10]:
+            lat, lng, acc, q = float(c[9]), float(c[10]), int(float(c[11] or 0)), "schaetzung"
+        else:
+            lat = lng = acc = None; q = "unbekannt"
+        if not m:
+            o = offen.setdefault(key, {"schluessel": key, "plmn": plmn, "enb": enb, "tac": c[2], "anzahl": 0,
+                                       "zuletzt": 0, "lat": lat, "lng": lng, "genauigkeit_m": acc})
+            o["anzahl"] += 1; o["zuletzt"] = zeit
+        if pkt and pkt[-1]["schluessel"] == key:
+            pkt[-1]["bis"] = zeit; pkt[-1]["n"] += 1
+            continue
+        pkt.append({"von": zeit, "bis": zeit, "n": 1, "schluessel": key, "enb": enb, "cellid": c[4],
+                    "distanz_m": int(c[8] or 0), "rsrp": c[6], "lat": lat, "lng": lng, "genauigkeit_m": acc, "quelle": q})
+    gps = [[t // 1000, la, ln, round(acc or 0), q or "alt"] for t, la, ln, acc, sp, hd, q in db.gps(int(ab * 1000) - 1, int(bis * 1000))]
+    step = max(1, len(gps) // 4000)
+    return {"von": int(ab), "bis": int(min(bis, time.time())), "punkte": pkt, "ohne_mast": sorted(offen.values(), key=lambda o: -o["zuletzt"]),
+            "gps": gps[::step],
+            "strecken": [{"name": s["name"], "quelle": s["quelle"], "punkte": [q[1:] for q in s["punkte"] if ab <= q[0] <= bis]}
+                         for s in load(STRECKEN, []) if any(ab <= q[0] <= bis for q in s["punkte"])]}
+
+
+def gps_punkte():
+    return [(t / 1000, la, ln, 999 if acc is None else acc) for t, la, ln, acc, sp, hd, q in db.gps()]
+
+
+def gps_bei(pts, t):
+    """GPS-Position zum Zeitpunkt t, linear zwischen Nachbarpunkten (≤ 20 s, ≤ 50 m genau), sonst None."""
+    import bisect
+    i = bisect.bisect_right(pts, (t, 1e9))
+    if i == 0 or i >= len(pts):
+        return None
+    a, b = pts[i - 1], pts[i]
+    if b[0] - a[0] > GPS_LUECKE_S or max(a[3], b[3]) > GPS_GENAU_M:
+        return None
+    f = 0 if b[0] == a[0] else (t - a[0]) / (b[0] - a[0])
+    return a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2])
+
+
+_VCACHE = {"t": 0, "d": None}
+
+
+def vorschlaege():
+    """Mast-Vorschläge aus allen Messpaaren (Handy-GPS + primäre Zelle mit Abstand) für Masten ohne Eintrag.
+    Erst je eNB über alle Sektoren; passt das nicht zusammen (abgesetzte Antennen), je Sektor."""
+    if time.time() - _VCACHE["t"] < 60:
+        return _VCACHE["d"]
+    pts, masten, verw = gps_punkte(), load(MASTEN, {}), set(load(VERWORFEN, []))
+    by_enb, by_sek = defaultdict(list), defaultdict(list)
+    for m in db.messungen():
+        c = next((z for z in m.get("zellen", []) if z.get("verbunden") == "primary"), None)
+        if not c or not c.get("distanz_m"):
+            continue
+        p = gps_bei(pts, m["t"])
+        if p:
+            o = {"lat": p[0], "lng": p[1], "distanz_m": c["distanz_m"]}
+            by_enb[f'{c["plmn"]}:{c["enb"]}'].append(o)
+            by_sek[f'{c["plmn"]}:{c["enb"]}:{c["sektor"]}'].append(o)
+    out = []
+    for k, obs in by_enb.items():
+        if k in masten:
+            continue
+        e = schaetzung(obs)
+        if e:
+            if k not in verw:
+                out.append({"schluessel": k, **e})
+            continue
+        for sk, so in by_sek.items():
+            if sk.startswith(k + ":") and sk not in masten and sk not in verw:
+                es = schaetzung(so)
+                if es:
+                    out.append({"schluessel": sk, **es})
+    _VCACHE.update(t=time.time(), d=out)
+    return out
+
+
+def owntracks_ok(header):
+    """Basic Auth der OwnTracks-App gegen owntracks.auth prüfen (Kennwort nur als SHA-256 gespeichert)."""
+    try:
+        user, _, pw_hash = open(OWNTRACKS_AUTH).read().strip().partition(":")
+        u, _, pw = base64.b64decode(header.split(" ", 1)[1]).decode().partition(":")
+    except (OSError, IndexError, ValueError, UnicodeDecodeError):
+        return False
+    return bool(user) and hmac.compare_digest(u, user) and hmac.compare_digest(hashlib.sha256(pw.encode()).hexdigest(), pw_hash)
+
+
+def tracking():
+    st = load(TRACKING, {"an": False, "seit": None})
+    if st.get("an") and time.time() - (st.get("seit") or 0) > TRACKING_MAX_S:
+        st = {"an": False, "seit": int(time.time()), "grund": "nach 12 h automatisch aus"}
+        save(TRACKING, st)
+    return st
+
+
+def ot_befehl(an):
+    """Befehl an OwnTracks (Antwort auf eine Meldung): Move mit dichten Meldungen oder Significant zum Akkusparen."""
+    cfg = ({"monitoring": 2, "locatorDisplacement": 50, "locatorInterval": 15, "ignoreInaccurateLocations": 50} if an
+           else {"monitoring": 1, "locatorDisplacement": 200, "locatorInterval": 180})
+    return {"_type": "cmd", "action": "setConfiguration", "configuration": {"_type": "configuration", **cfg}}
+
+
+def gps_schreiben(punkte, quelle="browser"):
+    """Punkte [{t (ms), lat, lng, acc, speed (m/s), heading}] in die Datenbank (Tabelle gps) schreiben; setzt die 15-s-Abfrage der Box in Gang."""
+    lines = []
+    for q in punkte[:500]:
+        lines.append((int(num(q["t"], 1.7e12, 2.2e12)), round(num(q["lat"], 47, 55.5), 6), round(num(q["lng"], 5.5, 15.5), 6),
+                      round(num(q.get("acc", 0) or 0, 0, 1e5)), None if q.get("speed") is None else round(num(q["speed"], 0, 100), 1),
+                      None if q.get("heading") is None else round(num(q["heading"], 0, 360)), quelle))
+    db.gps_schreiben(lines)
+    with open(AUFNAHME, "w") as f:
+        f.write(str(int(time.time())))
+    return len(lines)
+
+
+# ---- Push an offene Seiten (Server-Sent Events, /api/mast/stream) ----
+# Ein Wächter-Thread prüft alle 0,5 s, ob sich Dateien geändert haben, und verteilt die Änderung an alle Verbindungen.
+# zusätzliche JSON-Dateien aus der Konfiguration (z. B. Daten einer übergeordneten Seite) gehen ebenfalls per Push raus
+PUSH = {"fritzgeo": GEO, **K["api"]["push_dateien"]}
+KLIENTEN, KLIENTEN_LOCK = set(), threading.Lock()
+
+
+def verteilen(ereignis, daten):
+    msg = f"event: {ereignis}\ndata: {daten}\n\n".encode()
+    with KLIENTEN_LOCK:
+        for q in list(KLIENTEN):
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                pass
+
+
+def roh(p):
+    try:
+        with open(p) as f:
+            return json.dumps(json.load(f), separators=(",", ":"), ensure_ascii=False)
+    except (OSError, ValueError):
+        return None
+
+
+def tracking_json():
+    return json.dumps({**tracking(), "letzte": load(OT_LETZTE, None)}, ensure_ascii=False)
+
+
+def waechter():
+    def mt(p):
+        try:
+            return os.stat(p).st_mtime_ns
+        except OSError:
+            return 0
+    dateien = dict(PUSH)
+    stand = {k: mt(p) for k, p in dateien.items()}
+    neben = {"tracking": [TRACKING, OT_LETZTE], "masten": [MASTEN, VERWORFEN]}
+    nstand = {k: [mt(p) for p in ps] for k, ps in neben.items()}
+    try:
+        gps_pos = max([p[0] for p in db.gps(int(time.time() * 1000) - 60000)] or [int(time.time() * 1000)])
+    except Exception:
+        gps_pos = int(time.time() * 1000)
+    gps_blick = 0
+    while True:
+        time.sleep(0.5)
+        try:
+            for k, p in dateien.items():
+                m = mt(p)
+                if m != stand[k]:
+                    stand[k] = m
+                    d = roh(p)
+                    if d:
+                        verteilen(k, d)
+            for k, ps in neben.items():
+                m = [mt(p) for p in ps]
+                if m != nstand[k]:
+                    nstand[k] = m
+                    verteilen(k, tracking_json() if k == "tracking" else "{}")
+            # neue GPS-Punkte seit dem letzten Blick (höchstens alle 2 s in der Datenbank nachsehen)
+            if time.time() - gps_blick > 2:
+                gps_blick = time.time()
+                neu = db.gps(gps_pos)
+                if neu:
+                    gps_pos = neu[-1][0]
+                    verteilen("gps", json.dumps([[t // 1000, la, ln, round(acc or 999), q or "alt"] for t, la, ln, acc, sp, hd, q in neu]))
+        except Exception as e:  # Wächter darf nie sterben
+            print("Wächter:", e, flush=True)
+
+
+def abschnitte(tage=14):
+    """2-Stunden-Abschnitte (lokale Zeit, gerade Stunden) der letzten Tage, in denen GPS- oder Zelldaten liegen."""
+    ab, z = time.time() - tage * 86400, defaultdict(lambda: [0, 0])
+    def block(t):
+        lt = time.localtime(t)
+        return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour - lt.tm_hour % 2, 0, 0, 0, 0, -1)))
+    for p in db.gps(int(ab * 1000)):
+        z[block(p[0] / 1000)][0] += 1
+    for c in db.verlauf(int(ab)):
+        z[block(int(c[0]))][1] += 1
+    return [{"von": k, "bis": k + 7200, "gps": v[0], "zellen": v[1]} for k, v in sorted(z.items(), reverse=True)]
+
+
+_ACACHE = {"t": 0, "d": None}
+
+
+def abdeckung():
+    """Netzabdeckung aus Messpaaren: Raster ~110 m, je Kachel Median RSRP/RSRQ der primären Zelle (alle Daten, 90 Tage)."""
+    if time.time() - _ACACHE["t"] < 300:
+        return _ACACHE["d"]
+    import statistics
+    pts, k = gps_punkte(), defaultdict(list)
+    for m in db.messungen():
+        c = next((z for z in m.get("zellen", []) if z.get("verbunden") == "primary"), None)
+        p = gps_bei(pts, m["t"]) if c and c.get("rsrp") else None
+        if p:
+            k[(round(p[0] / 0.001), round(p[1] / 0.0016))].append((c["rsrp"], c.get("rsrq"), m.get("technik"), c["enb"]))
+    out = [{"lat": round(a * 0.001, 4), "lng": round(b * 0.0016, 4), "rsrp": round(statistics.median(x[0] for x in v)),
+            "rsrq": round(statistics.median(x[1] for x in v if x[1] is not None)) if any(x[1] is not None for x in v) else None,
+            "n": len(v), "enb": sorted({x[3] for x in v})[:4]} for (a, b), v in k.items()]
+    _ACACHE.update(t=time.time(), d=out)
+    return out
+
+
+_WCACHE = {"t": 0, "d": None}
+
+
+def _median(v):
+    v = sorted(v)
+    return round(v[len(v) // 2]) if v else None
+
+
+def _p(v, q):
+    v = sorted(v)
+    return round(v[min(len(v) - 1, int(len(v) * q))]) if v else None
+
+
+def _m(a, b, c, d):
+    x, y = enu(a, b, c, d)
+    return math.hypot(x, y)
+
+
+def _huelle(p):
+    """Konvexe Hülle (monotone chain) einer Punktliste [(lat, lng)]."""
+    p = sorted(set(p))
+    if len(p) < 3:
+        return p
+    def kreuz(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    unten, oben = [], []
+    for q in p:
+        while len(unten) >= 2 and kreuz(unten[-2], unten[-1], q) <= 0:
+            unten.pop()
+        unten.append(q)
+    for q in reversed(p):
+        while len(oben) >= 2 and kreuz(oben[-2], oben[-1], q) <= 0:
+            oben.pop()
+        oben.append(q)
+    return unten[:-1] + oben[:-1]
+
+
+def _fpd(a, b):
+    """Abstand zweier Fingerabdrücke {zelle: RSRP}: mittlere RSRP-Differenz, fehlende Zelle = -125 dBm."""
+    ks = set(a) | set(b)
+    return math.sqrt(sum((a.get(k, -125) - b.get(k, -125)) ** 2 for k in ks) / len(ks))
+
+
+def auswertung():
+    """Alles, was sich aus Handy-GPS + Zellmessungen lernen lässt (cache 5 min):
+    guete    Ortungsfehler je Fahrt: angezeigte Ortung damals, Zellschwerpunkt und Fingerabdruck jeweils aus den anderen Fahrten
+    funk     Raster mit Ausfällen (Box antwortet nicht) und Ping-Laufzeit, dazu Abbruchpunkte
+    gebiete  Versorgungsgebiet je primärer Zelle (konvexe Hülle) und Zellwechsel samt Ping-Pong
+    masten   Nachschärfen bekannter Masten aus den Abstandsringen (Vorschlag, übernehmen nur von Hand)"""
+    if time.time() - _WCACHE["t"] < 300:
+        return _WCACHE["d"]
+    import bisect
+    pts = gps_punkte()
+    rec = db.messungen()
+    vl = {int(c[0]): (float(c[9]), float(c[10])) for c in db.verlauf() if c[9] and c[10]}
+    # Messpaare: erfolgreiche Abfrage + GPS-Position
+    paare = []
+    for m in rec:
+        prim = next((c for c in m.get("zellen", []) if c.get("verbunden") == "primary"), None)
+        p = gps_bei(pts, m["t"]) if prim else None
+        if p:
+            paare.append({"t": m["t"], "p": p, "z": prim, "k": f'{prim["plmn"]}:{prim["enb"]}:{prim["sektor"]}',
+                          "fp": {f'{c["plmn"]}:{c["eci"]}': c["rsrp"] for c in m["zellen"] if c.get("eci") and c.get("rsrp") is not None},
+                          "rtt": m.get("rtt")})
+    # Fahrten: Box hängt im Auto, eingeschaltet = Fahrt. Neue Fahrt bei anderer Einschaltzeit (Uptime) oder,
+    # bei älteren Daten ohne "boot", wenn die Box länger als 5 min nichts geliefert hat (sie fragt sonst ≥ 1×/min ab).
+    fahrten, fid = [], {}
+    for m in rec:
+        if "zellen" not in m:
+            continue
+        neu = not fahrten or m["t"] - fahrten[-1]["bis"] > 300 or (
+            m.get("boot") and fahrten[-1]["boot"] and abs(m["boot"] - fahrten[-1]["boot"]) > 60)
+        if neu:
+            fahrten.append({"von": m["t"], "bis": m["t"], "boot": m.get("boot"), "n": 0, "gps": 0})
+        f = fahrten[-1]
+        f["bis"] = m["t"]; f["n"] += 1; f["boot"] = f["boot"] or m.get("boot")
+        # Datenmengen je Fahrt: Summe der Zuwächse (Zähler-Neustart → Wert zählt ab 0)
+        for k in ("box_b", "wg_b"):
+            v = m.get(k)
+            if v:
+                alt = f.setdefault("_" + k, None)
+                s = f.setdefault(k, [0, 0])
+                if alt:
+                    for i in (0, 1):
+                        s[i] += v[i] - alt[i] if v[i] >= alt[i] else v[i]
+                elif k == "box_b":
+                    s[0], s[1] = v      # Box-Zähler laufen ab dem Einschalten = ab Fahrtbeginn
+                f["_" + k] = v
+        fid[m["t"]] = len(fahrten) - 1
+    for q in paare:
+        q["f"] = fid.get(q["t"], -1)
+        if q["f"] >= 0:
+            fahrten[q["f"]]["gps"] += 1
+    # --- Ortungsgüte je Fahrt
+    frei = load(STATE + "/frei.json", {})
+    nach_f = defaultdict(list)
+    for q in paare:
+        nach_f[q["f"]].append(q)
+    guete = []
+    for f, qs in sorted(nach_f.items()):
+        ang, sp, fp = [], [], []
+        andere = [x for x in paare if x["f"] != f]
+        schwer = defaultdict(list)
+        for x in andere:
+            schwer[x["k"]].append(x["p"])
+        for q in qs:
+            v = vl.get(q["t"])
+            if v:
+                ang.append(_m(*q["p"], *v))
+            s = schwer.get(q["k"])
+            if s:
+                sp.append(_m(*q["p"], sum(a[0] for a in s) / len(s), sum(a[1] for a in s) / len(s)))
+                nb = sorted((x for x in andere if x["k"] == q["k"]), key=lambda x: _fpd(q["fp"], x["fp"]))[:3]
+                fp.append(_m(*q["p"], sum(x["p"][0] for x in nb) / len(nb), sum(x["p"][1] for x in nb) / len(nb)))
+        if f < 0:
+            continue
+        # freie Daten (BeaconDB/OpenCelliD, rechnet mastblick-melden mit Netzzugriff): Fahrt über Zeitüberlappung zuordnen
+        fr = next((x for x in frei.get("fahrten", []) if x["von"] <= fahrten[f]["bis"] and x["bis"] >= fahrten[f]["von"]), {})
+        guete.append({"von": fahrten[f]["von"], "bis": fahrten[f]["bis"], "n": len(qs),
+                      "frei": fr.get("bdb", {"n": 0, "median": None, "p90": None}), "frei_ocid": fr.get("ocid"),
+                      "angezeigt": {"n": len(ang), "median": _median(ang), "p90": _p(ang, .9)},
+                      "zellschwerpunkt": {"n": len(sp), "median": _median(sp), "p90": _p(sp, .9)},
+                      "fingerabdruck": {"n": len(fp), "median": _median(fp), "p90": _p(fp, .9)}})
+    # --- Funklöcher und Latenz: jeder GPS-Punkt bekommt den Zustand der Box zu dieser Zeit
+    ts = [m["t"] for m in rec]
+    def zustand(t):
+        i = bisect.bisect_left(ts, t - 15)
+        nah = [rec[j] for j in range(i, len(ts)) if ts[j] <= t + 15]
+        if any("fehler" in m for m in nah):
+            # nur ein Funkloch, wenn die Box davor und danach geantwortet hat: sonst wurde sie gerade ausgeschaltet
+            # (Fahrtende) oder startet noch (Fahrtbeginn, Tunnel noch nicht oben)
+            nach = bisect.bisect_right(ts, t)
+            vor = bisect.bisect_left(ts, t)
+            danach = any("zellen" in rec[j] for j in range(nach, len(ts)) if ts[j] - t < 600)
+            davor = any("zellen" in rec[j] for j in range(vor - 1, -1, -1) if t - ts[j] < 600)
+            return "aus" if danach and davor else None
+        if nah:
+            return "ok"
+        # ältere Daten ohne Fehlerzeilen: keine Abfrage im Umkreis von 25 s, aber die Box lief davor und danach
+        i = bisect.bisect_left(ts, t - 25)
+        if i < len(ts) and ts[i] <= t + 25:
+            return None
+        vor = bisect.bisect_left(ts, t) - 1
+        if vor >= 0 and t - ts[vor] < 600 and vor + 1 < len(ts) and ts[vor + 1] - t < 600 and "zellen" in rec[vor]:
+            return "aus"
+        return None
+    kach = defaultdict(lambda: {"n": 0, "aus": 0, "rtt": []})
+    abbr, vorher, seit = [], None, None
+    for t, la, ln, acc in pts:
+        if acc > GPS_GENAU_M or not rec or t < ts[0] - 60 or t > ts[-1] + 60:
+            continue
+        z = zustand(t)
+        if z is None:
+            continue
+        k = kach[(round(la / 0.001), round(ln / 0.0016))]
+        k["n"] += 1
+        k["aus"] += z == "aus"
+        if z == "aus" and vorher != "aus":
+            abbr.append({"t": int(t), "lat": round(la, 6), "lng": round(ln, 6), "dauer_s": 0})
+            seit = t
+        elif z == "aus" and abbr:
+            abbr[-1]["dauer_s"] = int(t - seit)
+        vorher = z
+    for q in paare:
+        if q["rtt"] is not None:
+            kach[(round(q["p"][0] / 0.001), round(q["p"][1] / 0.0016))]["rtt"].append(q["rtt"])
+    funk = [{"lat": round(a * 0.001, 4), "lng": round(b * 0.0016, 4), "n": v["n"], "aus": v["aus"],
+             "rtt": _median(v["rtt"]), "rtt_n": len(v["rtt"])} for (a, b), v in kach.items() if v["aus"] or v["rtt"]]
+    # --- Versorgungsgebiete und Zellwechsel
+    geb = defaultdict(list)
+    for q in paare:
+        geb[q["k"]].append(q["p"])
+    wechsel = []
+    for a, b in zip(paare, paare[1:]):
+        if b["t"] - a["t"] <= 30 and a["k"] != b["k"]:
+            wechsel.append({"t": b["t"], "von": a["k"], "nach": b["k"], "lat": round((a["p"][0] + b["p"][0]) / 2, 6),
+                            "lng": round((a["p"][1] + b["p"][1]) / 2, 6), "pingpong": False})
+    for i, w in enumerate(wechsel):
+        for x in wechsel[i + 1:]:
+            if x["t"] - w["t"] > 120:
+                break
+            if x["von"] == w["nach"] and x["nach"] == w["von"]:
+                w["pingpong"] = x["pingpong"] = True
+    gebiete = [{"schluessel": k, "n": len(v), "huelle": [[round(a, 5), round(b, 5)] for a, b in _huelle(v)],
+                "lat": round(sum(a for a, _ in v) / len(v), 6), "lng": round(sum(b for _, b in v) / len(v), 6)}
+               for k, v in geb.items() if len(v) >= 3]
+    # --- Masten nachschärfen
+    masten, verw = load(MASTEN, {}), load(VERWORFEN, [])
+    korr = []
+    for mk, mv in masten.items():
+        teile = mk.split(":")
+        obs = [{"lat": q["p"][0], "lng": q["p"][1], "distanz_m": q["z"]["distanz_m"]} for q in paare
+               if q["z"].get("distanz_m") and f'{q["z"]["plmn"]}:{q["z"]["enb"]}' == ":".join(teile[:2])
+               and (len(teile) == 2 and f'{mk}:{q["z"]["sektor"]}' not in masten or len(teile) == 3 and str(q["z"]["sektor"]) == teile[2])]
+        if len(obs) < 3:
+            continue
+        alt = math.sqrt(sum((_m(mv["lat"], mv["lng"], o["lat"], o["lng"]) - o["distanz_m"] * TA_FAKTOR) ** 2 for o in obs) / len(obs))
+        e = schaetzung(obs)
+        eintrag = {"schluessel": mk, "anzahl": len(obs), "rms_alt_m": round(alt), "alt": {"lat": mv["lat"], "lng": mv["lng"]}}
+        if e:
+            versch = _m(mv["lat"], mv["lng"], e["lat"], e["lng"])
+            gut = "hoch" if e["anzahl"] >= 15 and e["rms_m"] <= 150 and e["eindeutig"] else "mittel" if e["rms_m"] <= 250 and e["eindeutig"] else "gering"
+            abgelehnt = any(v.startswith(f"korr:{mk}:") and int(v.rsplit(":", 1)[1]) * 2 > len(obs) for v in verw)
+            eintrag.update(neu={"lat": e["lat"], "lng": e["lng"]}, rms_neu_m=e["rms_m"], verschiebung_m=round(versch),
+                           eindeutig=e["eindeutig"], konfidenz=gut,
+                           vorschlag=versch > 150 and e["rms_m"] < 0.7 * alt and e["anzahl"] >= 6 and not abgelehnt)
+        korr.append(eintrag)
+    # einzelne Abfragen ohne GPS (z. B. Box kurz an) sind keine Fahrt
+    echte = [f for f in fahrten if f["n"] >= 3 or f["gps"]]
+    d = {"stand": int(time.time()), "frei_verlauf": frei.get("verlauf", {}),
+         "fahrten": [{k: f.get(k) for k in ("von", "bis", "n", "gps", "boot", "box_b", "wg_b")} for f in echte][-60:], "guete": guete, "funk": funk, "abbrueche": abbr[-300:],
+         "gebiete": gebiete, "wechsel": wechsel[-500:], "masten": korr}
+    _WCACHE.update(t=time.time(), d=d)
+    return d
+
+
+def num(v, lo, hi):
+    v = float(v)
+    if not (lo <= v <= hi) or math.isnan(v):
+        raise ValueError("Wert außerhalb des Bereichs")
+    return v
+
+
+class H(BaseHTTPRequestHandler):
+    def send(self, code, d):
+        b = json.dumps(d, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def log_message(self, *a):
+        pass
+
+    def stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")   # nginx und vorgeschaltete Proxys nicht puffern lassen
+        self.end_headers()
+        q = queue.Queue(maxsize=200)
+        with KLIENTEN_LOCK:
+            KLIENTEN.add(q)
+        try:
+            self.wfile.write(b"retry: 3000\n\n")
+            for k, p in PUSH.items():
+                d = roh(p)
+                if d:
+                    self.wfile.write(f"event: {k}\ndata: {d}\n\n".encode())
+            self.wfile.write(f"event: tracking\ndata: {tracking_json()}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                try:
+                    msg = q.get(timeout=15)
+                except queue.Empty:
+                    msg = b"event: ping\ndata: {}\n\n"
+                self.wfile.write(msg)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with KLIENTEN_LOCK:
+                KLIENTEN.discard(q)
+
+    def do_GET(self):
+        p, _, q = self.path.partition("?")
+        if p == "/api/mast/stream":
+            return self.stream()
+        if p == "/api/mast":
+            return self.send(200, status())
+        if p == "/api/mast/status":
+            return self.send(200, load(GEO, {"ok": False, "fehler": "noch keine Abfrage"}))
+        if p == "/api/mast/tracking":
+            return self.send(200, {**tracking(), "letzte": load(OT_LETZTE, None)})
+        if p == "/api/mast/vorschlaege":
+            return self.send(200, vorschlaege())
+        if p == "/api/mast/masten":
+            return self.send(200, load(MASTEN, {}))
+        if p == "/api/mast/verlauf":
+            a = dict(x.split("=", 1) for x in q.split("&") if "=" in x)
+            if a.get("von", "").isdigit():
+                von = int(a["von"]); bis = int(a["bis"]) if a.get("bis", "").isdigit() else von + 7200
+            else:
+                h = int(a["h"]) if a.get("h", "").isdigit() and 0 < int(a["h"]) <= 72 else 2
+                von, bis = time.time() - h * 3600, time.time() + 60
+            return self.send(200, verlauf(von, min(bis, von + 72 * 3600)))
+        if p == "/api/mast/abschnitte":
+            return self.send(200, abschnitte())
+        if p == "/api/mast/abdeckung":
+            return self.send(200, abdeckung())
+        if p == "/api/mast/auswertung":
+            return self.send(200, auswertung())
+        web = K["api"]["web_verzeichnis"]
+        if web and p in ("/", "/index.html"):
+            b = open(os.path.join(web, "index.html"), "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            return self.wfile.write(b)
+        self.send(404, {"fehler": "unbekannt"})
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 65536:
+                return self.send(413, {"fehler": "zu groß"})
+            d = json.loads(self.rfile.read(n) or b"{}")
+            p = self.path.split("?")[0]
+            if p == "/api/mast/gps":
+                return self.send(200, {"ok": True, "gespeichert": gps_schreiben(d.get("punkte", []))})
+            if p == "/api/owntracks":
+                # OwnTracks HTTP-Modus: einzelne Nachricht, Antwort muss ein JSON-Array sein
+                if not owntracks_ok(self.headers.get("Authorization", "")):
+                    self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="owntracks"'); self.send_header("Content-Length", "0"); self.end_headers()
+                    return
+                # Positionen nur speichern, wenn das Tracking bewusst eingeschaltet ist; sonst verwerfen
+                st, letzte = tracking(), load(OT_LETZTE, {})
+                for m in (d if isinstance(d, list) else [d]):
+                    if isinstance(m, dict) and m.get("_type") == "location" and "lat" in m and "lon" in m:
+                        letzte = {"t": int(m.get("tst") or time.time()), "acc": m.get("acc"), "modus": m.get("m"), "akku": m.get("batt"),
+                                  "gespeichert": bool(st.get("an")), "befehl_t": letzte.get("befehl_t")}
+                        if st.get("an"):
+                            gps_schreiben([{"t": letzte["t"] * 1000, "lat": m["lat"], "lng": m["lon"],
+                                            "acc": m.get("acc") if m.get("acc") is not None else 999,
+                                            "speed": None if m.get("vel") is None or m["vel"] < 0 else m["vel"] / 3.6,
+                                            "heading": None if m.get("cog") is None or m["cog"] < 0 else m["cog"]}], "owntracks")
+                # Modus der App angleichen: Befehl nur, wenn er abweicht (ohne Modusangabe höchstens alle 10 min)
+                soll = 2 if st.get("an") else 1
+                antwort = []
+                if letzte.get("modus") != soll and (letzte.get("modus") is not None or time.time() - (letzte.get("befehl_t") or 0) > 600):
+                    antwort = [ot_befehl(st.get("an"))]
+                    letzte["befehl_t"] = int(time.time())
+                if letzte:
+                    save(OT_LETZTE, letzte)
+                return self.send(200, antwort)
+            if p == "/api/mast/tracking":
+                an = bool(d.get("an"))
+                save(TRACKING, {"an": an, "seit": int(time.time()), "grund": "über die Webseite"})
+                return self.send(200, {**tracking(), "letzte": load(OT_LETZTE, None)})
+            g, z = zelle()
+            if not z:
+                return self.send(409, {"fehler": "keine Zellinfo der FRITZ!Box"})
+            key = f'{z["plmn"]}:{z["enb"]}'
+            if p == "/api/mast/beobachtung":
+                if time.time() - g.get("abgefragt", 0) > MAX_GEO_ALTER or not g.get("ok"):
+                    return self.send(409, {"fehler": "Zellinfo der FRITZ!Box ist älter als 10 Minuten"})
+                acc = num(d["genauigkeit_m"], 0, 100000)
+                if acc > MAX_GENAU:
+                    return self.send(422, {"fehler": f"Position zu ungenau (±{round(acc)} m, nötig ≤ {MAX_GENAU} m). Draußen oder am Handy mit GPS erneut versuchen."})
+                if not z.get("distanz_m"):
+                    return self.send(422, {"fehler": "Die FRITZ!Box meldet gerade keinen Abstand zum Mast"})
+                obs = load(OBS, [])
+                obs.append({"zeit": int(time.time()), "plmn": z["plmn"], "enb": z["enb"], "sektor": z["sektor"], "distanz_m": z["distanz_m"],
+                            "rsrp": z.get("rsrp"), "lat": num(d["lat"], 47, 55.5), "lng": num(d["lng"], 5.5, 15.5),
+                            "genauigkeit_m": round(acc)})
+                save(OBS, obs[-2000:])
+                return self.send(200, status())
+            if p == "/api/mast/setzen":
+                # ohne "schluessel" gilt der aktuelle Mast, sonst ein Mast aus dem Verlauf ("<PLMN>:<eNB>")
+                if d.get("schluessel"):
+                    teile = str(d["schluessel"]).split(":")
+                    if not (len(teile) in (2, 3) and all(t.isdigit() for t in teile) and len(teile[0]) in (5, 6)):
+                        raise ValueError("schluessel")
+                    key = ":".join(str(int(t)) if i else t for i, t in enumerate(teile))
+                elif d.get("sektor"):
+                    key = f'{key}:{z["sektor"]}'
+                m = load(MASTEN, {})
+                alt = m.get(key)
+                m[key] = {"lat": round(num(d["lat"], 47, 55.5), 6), "lng": round(num(d["lng"], 5.5, 15.5), 6),
+                          "quelle": str(d.get("quelle") or "manuell")[:120], "notiz": str(d.get("notiz") or "")[:200],
+                          "erfasst": time.strftime("%Y-%m-%d")}
+                if alt:
+                    # beim Überschreiben (z. B. Nachschärfen) die vorige Position behalten, um zurückgehen zu können
+                    m[key]["vorher"] = {k: alt.get(k) for k in ("lat", "lng", "quelle", "erfasst")}
+                save(MASTEN, m)
+                _VCACHE["t"] = _WCACHE["t"] = 0
+                return self.send(200, status())
+            if p == "/api/mast/verwerfen":
+                v = load(VERWORFEN, []); k = str(d["schluessel"])[:40]
+                if k not in v:
+                    v.append(k); save(VERWORFEN, v)
+                _VCACHE["t"] = _WCACHE["t"] = 0
+                return self.send(200, {"ok": True})
+            if p == "/api/mast/loeschen":
+                m = load(MASTEN, {}); skey = f'{key}:{z["sektor"]}'
+                m.pop(skey if skey in m else key, None); save(MASTEN, m)
+                return self.send(200, status())
+            if p == "/api/mast/beobachtungen-loeschen":
+                save(OBS, [o for o in load(OBS, []) if not (f'{o["plmn"]}:{o["enb"]}' == key and o.get("sektor") in (None, z["sektor"]))])
+                return self.send(200, status())
+            self.send(404, {"fehler": "unbekannt"})
+        except (KeyError, ValueError, TypeError) as e:
+            self.send(400, {"fehler": f"ungültige Eingabe: {e}"})
+
+
+if __name__ == "__main__":
+    threading.Thread(target=waechter, daemon=True).start()
+    srv = ThreadingHTTPServer((K["api"]["adresse"], int(K["api"]["port"])), H)
+    srv.daemon_threads = True
+    srv.serve_forever()
