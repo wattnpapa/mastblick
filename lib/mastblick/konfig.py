@@ -26,6 +26,8 @@ STANDARD = {
         "web_verzeichnis": "",
         # weitere JSON-Dateien, die per Push an die Seite gehen: {ereignis = "/pfad/datei.json"}
         "push_dateien": {},
+        # Dateien, deren Änderung nur als Signal (ohne Inhalt) gemeldet wird – für große Dateien: {ereignis = [pfade]}
+        "push_signale": {},
     },
     "melden": {
         # Messpaare (Handy-GPS + Zellen) an freie Datenbanken melden – nur mit ausdrücklichem Einverständnis einschalten

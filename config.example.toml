@@ -28,6 +28,8 @@ owntracks_auth = "/etc/mastblick/owntracks.auth"
 web_verzeichnis = ""
 # weitere JSON-Dateien, die bei Änderung per Push an offene Seiten gehen
 # push_dateien = { meine_daten = "/var/www/meine-daten.json" }
+# nur Signal ohne Inhalt (große Dateien), die Seite lädt dann selbst nach:
+# push_signale = { statistik = ["/var/www/statistik.json"] }
 
 [melden]
 # Messpaare (Handy-GPS + Zellen) an freie Datenbanken melden. Standard: aus.

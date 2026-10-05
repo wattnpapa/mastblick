@@ -288,7 +288,8 @@ def waechter():
             return 0
     dateien = dict(PUSH)
     stand = {k: mt(p) for k, p in dateien.items()}
-    neben = {"tracking": [TRACKING, OT_LETZTE], "masten": [MASTEN, VERWORFEN]}
+    neben = {"tracking": [TRACKING, OT_LETZTE], "masten": [MASTEN, VERWORFEN],
+             **{k: list(v) if isinstance(v, list) else [v] for k, v in K["api"]["push_signale"].items()}}
     nstand = {k: [mt(p) for p in ps] for k, ps in neben.items()}
     try:
         gps_pos = max([p[0] for p in db.gps(int(time.time() * 1000) - 60000)] or [int(time.time() * 1000)])
