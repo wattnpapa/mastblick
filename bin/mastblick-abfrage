@@ -15,6 +15,7 @@ _sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirn
 from mastblick import db, konfig
 
 K = konfig.K
+STATE = konfig.DATEN
 NETRC = K["box"]["netrc"]
 URL = konfig.box_url("/upnp/control/x_wanmobileconn")
 SVC = "urn:dslforum-org:service:X_AVM-DE_WANMobileConnection:1"
