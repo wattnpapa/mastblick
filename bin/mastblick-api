@@ -29,6 +29,7 @@ AUFNAHME = konfig.datei("aufnahme")     # mtime = letzte GPS-Meldung; mastblick-
 MAX_GEO_ALTER = 600      # Zellinfo darf höchstens 10 min alt sein, sonst passt sie nicht zur Position
 MAX_GENAU = 150          # Browser-Position genauer als 150 m, sonst nutzlos
 MIN_STREUUNG = 100       # Beobachtungen müssen mindestens so weit auseinander liegen
+NAH_M = 40               # Abstand 0: Mast liegt innerhalb weniger Dutzend Meter
 TA_FAKTOR = 1.2          # Abstand der FRITZ!Box ist zu kurz: echt ≈ 1,2 × gemeldet (Auswertung mit Handy-GPS)
 MAX_ABWEICHUNG = 400     # Ausgleichsrechnung mit größerem Restfehler gilt als unbrauchbar
 MAX_ENTFERNUNG = 15000   # Mast weiter als 15 km vom Schwerpunkt der Messpunkte: verwerfen
@@ -70,12 +71,13 @@ def latlng(lat0, lng0, x, y):
 
 def schaetzung(obs):
     """Mastposition aus Ringen (Position, Abstand) per Gauss-Newton; None, wenn zu wenig oder zu eng beieinander."""
-    obs = [o for o in obs if o.get("distanz_m")]
+    # Abstand 0 heißt: Mast in unmittelbarer Nähe – gerade diese Messungen sind wertvoll
+    obs = [o for o in obs if o.get("distanz_m") is not None]
     if len(obs) < 3:
         return None
     lat0 = sum(o["lat"] for o in obs) / len(obs)
     lng0 = sum(o["lng"] for o in obs) / len(obs)
-    pts = [(*enu(lat0, lng0, o["lat"], o["lng"]), o["distanz_m"] * TA_FAKTOR) for o in obs]
+    pts = [(*enu(lat0, lng0, o["lat"], o["lng"]), max(o["distanz_m"] * TA_FAKTOR, NAH_M)) for o in obs]
     if max(math.hypot(a[0] - b[0], a[1] - b[1]) for a in pts for b in pts) < MIN_STREUUNG:
         return None
     best = None
@@ -193,7 +195,7 @@ def vorschlaege():
     by_enb, by_sek = defaultdict(list), defaultdict(list)
     for m in db.messungen():
         c = next((z for z in m.get("zellen", []) if z.get("verbunden") == "primary"), None)
-        if not c or not c.get("distanz_m"):
+        if not c or c.get("distanz_m") is None:
             continue
         p = gps_bei(pts, m["t"])
         if p:
