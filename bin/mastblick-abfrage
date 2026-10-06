@@ -2,7 +2,8 @@
 # mastblick-abfrage: verortet eine FRITZ!Box mit LTE grob über ihre Mobilfunkzelle.
 # 1. TR-064 X_AVM-DE_WANMobileConnection#GetInfoEx liefert alle sichtbaren Zellen (Zugangsdaten in einer netrc-Datei)
 #    Cellid und TAC kommen hexadezimal: "06258-15" → eNB 0x06258, Sektor 0x15, ECI 0x625815
-# 2. Ort: eigene Zelldatenbank (aus Handy-GPS gelernt) vor eigener Mastdatenbank vor BeaconDB/OpenCelliD
+# 2. Ort: eigene Zelldatenbank (aus Handy-GPS gelernt) vor eigener Mastdatenbank vor anderen Sektoren derselben
+#    Station aus der eigenen Zelldatenbank vor BeaconDB/OpenCelliD
 # 3. Ergebnis nach <daten>/status.json (Karte), jede Abfrage in die SQLite-Datenbank
 # Läuft als Dienst (--loop): alle 60 s, alle 10 s bei Handy-Tracking oder Mitschreiben im Browser
 # (mastblick-api berührt dann <daten>/aufnahme), sofort nach Änderung von masten.json.
@@ -31,6 +32,9 @@ MIN_ANZAHL = 3                      # ab so vielen eigenen Messungen gilt der Sc
 V_MAX = 50                          # m/s: schneller kann die Box nicht unterwegs sein
 HALTEN_MAX_S = 300                  # einen unplausiblen Sprung höchstens so lange ignorieren
 PP_FENSTER_S = 120                  # Ping-Pong: ≥ 2 Wechsel zwischen genau zwei Zellen in diesem Fenster
+FREI_MIN_M = 1500                   # BeaconDB/OpenCelliD melden für Einzelzellen oft ±200 m, liegen aber km daneben
+MAST_ABW_M = 800                    # Sektor passt nicht zum eNB-Mast, wenn GPS- und TA-Abstand im Median so weit abweichen
+NACHBAR_MIN_M = 1500                # Genauigkeit, wenn nur andere Sektoren derselben Station bekannt sind (Median 1,0 km)
 OCID_KEY = K["melden"]["opencellid_schluessel"]   # auch zum Nachschlagen genutzt, wenn vorhanden
 BOX_IP = K["box"]["adresse"]
 WG_IF = K["tunnel"]["wg_schnittstelle"]
@@ -224,8 +228,15 @@ def main():
     prim = info["zellen"][0] if info["zellen"] else {}
     masten = load(MASTEN, {})
     base = f'{prim.get("plmn")}:{prim.get("enb")}'
-    mast = masten.get(f'{base}:{prim.get("sektor")}') or masten.get(base)
-    eigen = load(ZELLEN, {}).get(f'{base}:{prim.get("sektor")}')
+    sk = f'{base}:{prim.get("sektor")}'
+    zellen = load(ZELLEN, {})
+    eigen = zellen.get(sk)
+    # Mast der ganzen Station nur für Sektoren, die dazu passen: abgesetzte Antennen (gemeldeter Abstand passt
+    # mehrfach nicht zur GPS-Entfernung, mastblick-melden rechnet das in zellen.json) bekommen ihn nicht
+    mast = masten.get(sk)
+    if not mast and base in masten and not ((eigen or {}).get("mast_n", 0) >= 2 and (eigen or {}).get("mast_abw_m", 0) > MAST_ABW_M):
+        mast = masten[base]
+    nachbarn = [v for k, v in zellen.items() if k.rsplit(":", 1)[0] == base and k != sk and v.get("anzahl", 0) >= MIN_ANZAHL]
     if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
         # eigene Messungen: Schwerpunkt der GPS-Positionen, an denen die Box mit dieser Zelle verbunden war
         geo = {"lat": eigen["lat"], "lng": eigen["lng"], "genauigkeit_m": eigen["streuung_m"], "quelle": "eigene Zelldaten",
@@ -234,7 +245,14 @@ def main():
         # Mast bekannt: Box liegt auf einem Ring mit dem gemeldeten Abstand (Timing Advance) um den Mast
         geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((prim.get("distanz_m") or 230) * TA_FAKTOR),
                "quelle": "Mastdatenbank", "mast": True, "enb": prim.get("enb"), "distanz_m": prim.get("distanz_m"),
-               "sektor": prim.get("sektor") if f'{base}:{prim.get("sektor")}' in masten else None}
+               "sektor": prim.get("sektor") if sk in masten else None}
+    elif nachbarn:
+        # Sektor neu, aber andere Sektoren derselben Station bekannt: deren Schwerpunkt (gewichtet nach Messungen)
+        n = sum(v["anzahl"] for v in nachbarn)
+        geo = {"lat": round(sum(v["lat"] * v["anzahl"] for v in nachbarn) / n, 6),
+               "lng": round(sum(v["lng"] * v["anzahl"] for v in nachbarn) / n, 6),
+               "genauigkeit_m": max(NACHBAR_MIN_M, max(v["streuung_m"] for v in nachbarn)),
+               "quelle": "eigene Zelldaten (andere Sektoren)", "anzahl": n}
     elif hit and now - hit["zeit"] < CACHE_TTL:
         geo = hit["geo"]
     else:
@@ -252,6 +270,8 @@ def main():
             cache[key] = {"zeit": now, "geo": geo}
             cache = {k: v for k, v in cache.items() if now - v["zeit"] < 7 * 86400}
             write_json(CACHE, cache)
+    if geo and geo.get("quelle") in ("BeaconDB", "OpenCelliD") and geo.get("genauigkeit_m") is not None:
+        geo = {**geo, "genauigkeit_m": max(geo["genauigkeit_m"], FREI_MIN_M)}
     # Ping-Pong-Glättung: springt die Box binnen PP_FENSTER_S nur zwischen zwei Zellen hin und her (Hälfte aller
     # Zellwechsel bei Testfahrten), liegt sie zwischen beiden → Mittelpunkt statt Hin- und Herspringen
     kurz = [k for k in last.get("kurz", []) if now - k[0] <= PP_FENSTER_S] if last.get("ok") else []

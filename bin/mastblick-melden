@@ -206,17 +206,25 @@ def lernen():
     """Für jede Zelle (als primäre Zelle der Box) Schwerpunkt und Streuung der zugehörigen GPS-Positionen.
     Ortet in der Praxis deutlich besser als Mast-Position, BeaconDB und OpenCelliD (siehe Gütekurve)."""
     import math, statistics
-    pos = {}
+    D = lambda a, b, c, d: math.hypot((d - b) * 111320 * math.cos(math.radians(a)), (c - a) * 110540)
+    masten = load(konfig.datei("masten.json"), {})
+    pos, abw = {}, {}
     for t, p, cells in paare(0):
         c = next((z for z in cells if z.get("verbunden") == "primary"), None)
         if c:
-            pos.setdefault(f'{c["plmn"]}:{c["enb"]}:{c["sektor"]}', []).append((p["lat"], p["lng"], t))
+            k, e = f'{c["plmn"]}:{c["enb"]}:{c["sektor"]}', f'{c["plmn"]}:{c["enb"]}'
+            pos.setdefault(k, []).append((p["lat"], p["lng"], t))
+            # passt der Sektor zum Mast der Station? |GPS-Entfernung zum Mast − 1,2 × gemeldeter Abstand|
+            if e in masten and k not in masten and c.get("distanz_m") is not None:
+                abw.setdefault(k, []).append(abs(D(p["lat"], p["lng"], masten[e]["lat"], masten[e]["lng"]) - 1.2 * c["distanz_m"]))
     out = {}
     for k, v in pos.items():
         la, lo = statistics.mean(x[0] for x in v), statistics.mean(x[1] for x in v)
         d = sorted(math.hypot((x[1] - lo) * 111320 * math.cos(math.radians(la)), (x[0] - la) * 110540) for x in v)
         out[k] = {"lat": round(la, 6), "lng": round(lo, 6), "streuung_m": max(100, round(d[int(len(d) * .75)])),
                   "anzahl": len(v), "zuletzt": int(max(x[2] for x in v))}
+        if k in abw:
+            out[k].update(mast_n=len(abw[k]), mast_abw_m=round(statistics.median(abw[k])))
     with open(ZELLEN + ".tmp", "w") as f:
         json.dump(out, f, indent=1)
     os.chmod(ZELLEN + ".tmp", 0o644)
