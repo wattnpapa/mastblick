@@ -544,9 +544,14 @@ def auswertung():
                 break
             if x["von"] == w["nach"] and x["nach"] == w["von"]:
                 w["pingpong"] = x["pingpong"] = True
-    gebiete = [{"schluessel": k, "n": len(v), "huelle": [[round(a, 5), round(b, 5)] for a, b in _huelle(v)],
-                "lat": round(sum(a for a, _ in v) / len(v), 6), "lng": round(sum(b for _, b in v) / len(v), 6)}
-               for k, v in geb.items() if len(v) >= 3]
+    # bekannter Mast (Sektor- vor eNB-Eintrag) gehört mit in die Hülle: das Gebiet beginnt am Mast
+    mdb = load(MASTEN, {})
+    def mast_von(k):
+        m = mdb.get(k) or mdb.get(k.rsplit(":", 1)[0])
+        return (m["lat"], m["lng"]) if m else None
+    gebiete = [{"schluessel": k, "n": len(v), "huelle": [[round(a, 5), round(b, 5)] for a, b in _huelle(v + ([mp] if mp else []))],
+                "lat": round(sum(a for a, _ in v) / len(v), 6), "lng": round(sum(b for _, b in v) / len(v), 6), "mast": mp}
+               for k, v in geb.items() if len(v) >= 3 for mp in [mast_von(k)]]
     # --- Masten nachschärfen
     masten, verw = load(MASTEN, {}), load(VERWORFEN, [])
     korr = []
