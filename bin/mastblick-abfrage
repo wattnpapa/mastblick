@@ -289,11 +289,12 @@ def main():
         geo = {**geo, "lat": round((a[2] + b[2]) / 2, 6), "lng": round((a[3] + b[3]) / 2, 6),
                "genauigkeit_m": round(max(a[4], b[4]) + d / 2), "pingpong": [a[1], b[1]]}
     # Plausibilität: Sprung weiter als seit dem letzten angenommenen Ort fahrbar und die neue Quelle ist nur eine fremde
-    # Schätzung → alten Ort halten. Fahrbare Strecke ab ort_seit rechnen, nicht ab der letzten Abfrage: sonst gilt beim
+    # Schätzung (BeaconDB, OpenCelliD, Schwerpunkt anderer Sektoren – Sektoren einer Station reichen teils 10 km weit
+    # auseinander) → alten Ort halten. Fahrbare Strecke ab ort_seit rechnen, nicht ab der letzten Abfrage: sonst gilt beim
     # Fahren jede neue Schätzung als Sprung und der Ort klebt jeweils HALTEN_MAX_S fest (bei einer Testfahrt bis 10 km daneben).
     lg = last.get("geo") or {}
     if (geo and geo.get("lat") is not None and lg.get("lat") is not None and last.get("ok")
-            and geo.get("quelle") in ("BeaconDB", "OpenCelliD") and now - last.get("abgefragt", now) < 600):
+            and geo.get("quelle") in ("BeaconDB", "OpenCelliD", "eigene Zelldaten (andere Sektoren)") and now - last.get("abgefragt", now) < 600):
         sprung = math.hypot((geo["lng"] - lg["lng"]) * 111320 * math.cos(math.radians(lg["lat"])), (geo["lat"] - lg["lat"]) * 110540)
         erlaubt = (V_MAX * max(10, now - last.get("ort_seit", now)) + 500
                    + min(lg.get("genauigkeit_m") or 0, 2000) + min(geo.get("genauigkeit_m") or 0, 2000))
