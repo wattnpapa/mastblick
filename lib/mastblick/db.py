@@ -4,7 +4,7 @@
 #   gps      Handy-Positionen (Browser, OwnTracks)
 # Alle Dienste laufen als Benutzer mastblick; WAL erlaubt Lesen, während geschrieben wird.
 # Lesefunktionen liefern einfache Formen: Messung als dict {t, technik, zellen, …}, Verlauf als Spaltenliste
-# (zeit, plmn, tac, eci, cellid, pci, rsrp, rsrq, distanz_m, lat, lng, genauigkeit_m) als Text.
+# (zeit, plmn, tac, eci, cellid, pci, rsrp, rsrq, distanz_m, lat, lng, genauigkeit_m, quelle) als Text.
 import sqlite3, time
 from mastblick import konfig
 
@@ -98,11 +98,11 @@ def messungen(seit=0, bis=None):
 
 def verlauf(ab=0, bis=None):
     """Erfolgreiche Abfragen mit primärer Zelle und angezeigtem Ort, je Zeile als Text:
-    zeit, plmn, tac, eci, cellid, pci, rsrp, rsrq, distanz_m, lat, lng, genauigkeit_m."""
+    zeit, plmn, tac, eci, cellid, pci, rsrp, rsrq, distanz_m, lat, lng, genauigkeit_m, quelle (Quelle des angezeigten Orts)."""
     bis = bis if bis is not None else 2 ** 40
     s = lambda v: "" if v is None else str(v)
     return _mit(lambda con: [[s(v) for v in r] for r in con.execute(
-        "SELECT a.t, z.plmn, z.tac, z.eci, z.cellid, z.pci, z.rsrp, z.rsrq, z.distanz_m, a.lat, a.lng, a.genauigkeit_m "
+        "SELECT a.t, z.plmn, z.tac, z.eci, z.cellid, z.pci, z.rsrp, z.rsrq, z.distanz_m, a.lat, a.lng, a.genauigkeit_m, a.quelle "
         "FROM abfrage a JOIN zelle z ON z.t = a.t AND z.nr = 0 WHERE a.ok = 1 AND a.t >= ? AND a.t <= ? ORDER BY a.t", (ab, bis))])
 
 

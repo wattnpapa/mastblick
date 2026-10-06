@@ -126,8 +126,10 @@ def status():
 
 
 def verlauf(ab, bis):
-    """Track der letzten Stunden aus der Datenbank (Abfragen mit primärer Zelle und angezeigtem Ort). Punkte mit inzwischen bekanntem Mast werden auf den Mast gesetzt.
-    Aufeinanderfolgende Punkte an derselben Zelle werden zusammengefasst (von/bis)."""
+    """Track aus der Datenbank: je Abfrage der damals berechnete Ort der Box (quelle "schaetzung"); nur wenn keiner
+    gespeichert ist, ersatzweise der Mast (quelle "mast"). Ein inzwischen bekannter Mast steht zusätzlich in "mast",
+    der Track springt also nicht von Mast zu Mast. Aufeinanderfolgende Abfragen an derselben Zelle mit (fast) gleichem
+    Ort werden zusammengefasst (von/bis)."""
     masten = load(MASTEN, {})
     pkt, offen = [], {}
     for c in db.verlauf(int(ab), int(bis)):
@@ -136,21 +138,24 @@ def verlauf(ab, bis):
         zeit, plmn, eci = int(c[0]), c[1], int(c[3])
         enb, key = eci >> 8, f"{plmn}:{eci >> 8}"
         m = masten.get(f"{key}:{eci & 255}") or masten.get(key)
-        if m:
-            lat, lng, acc, q = m["lat"], m["lng"], int(c[8] or 0) or 300, "mast"
-        elif c[9] and c[10]:
+        ort = (c[12] if len(c) > 12 else "") or "Zellschätzung"
+        if c[9] and c[10]:
             lat, lng, acc, q = float(c[9]), float(c[10]), int(float(c[11] or 0)), "schaetzung"
+        elif m:
+            lat, lng, acc, q, ort = m["lat"], m["lng"], int(c[8] or 0) or 300, "mast", "Mast"
         else:
             lat = lng = acc = None; q = "unbekannt"
         if not m:
             o = offen.setdefault(key, {"schluessel": key, "plmn": plmn, "enb": enb, "tac": c[2], "anzahl": 0,
                                        "zuletzt": 0, "lat": lat, "lng": lng, "genauigkeit_m": acc})
             o["anzahl"] += 1; o["zuletzt"] = zeit
-        if pkt and pkt[-1]["schluessel"] == key:
+        p = pkt[-1] if pkt else None
+        if p and p["schluessel"] == key and (lat is None or p["lat"] is None or abs(lat - p["lat"]) + abs(lng - p["lng"]) < 0.0005):
             pkt[-1]["bis"] = zeit; pkt[-1]["n"] += 1
             continue
         pkt.append({"von": zeit, "bis": zeit, "n": 1, "schluessel": key, "enb": enb, "cellid": c[4],
-                    "distanz_m": int(c[8] or 0), "rsrp": c[6], "lat": lat, "lng": lng, "genauigkeit_m": acc, "quelle": q})
+                    "distanz_m": int(c[8] or 0), "rsrp": c[6], "lat": lat, "lng": lng, "genauigkeit_m": acc, "quelle": q, "ort": ort,
+                    "mast": {"lat": m["lat"], "lng": m["lng"]} if m else None})
     gps = [[t // 1000, la, ln, round(acc or 0), q or "alt"] for t, la, ln, acc, sp, hd, q in db.gps(int(ab * 1000) - 1, int(bis * 1000))]
     step = max(1, len(gps) // 4000)
     return {"von": int(ab), "bis": int(min(bis, time.time())), "punkte": pkt, "ohne_mast": sorted(offen.values(), key=lambda o: -o["zuletzt"]),
