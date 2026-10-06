@@ -5,7 +5,8 @@
 # 2. Ort: eigene Zelldatenbank (aus Handy-GPS gelernt) vor eigener Mastdatenbank vor anderen Sektoren derselben
 #    Station aus der eigenen Zelldatenbank vor BeaconDB/OpenCelliD
 # 3. Ergebnis nach <daten>/status.json (Karte), jede Abfrage in die SQLite-Datenbank
-# Läuft als Dienst (--loop): alle 60 s, alle 10 s bei Handy-Tracking oder Mitschreiben im Browser
+# Läuft als Dienst (--loop): alle 60 s, alle 10 s bei Handy-Tracking oder Mitschreiben im Browser, schneller unterwegs
+# entsprechend öfter (etwa alle 150 m, höchstens alle 5 s; Geschwindigkeit aus dem Handy-GPS)
 # (mastblick-api berührt dann <daten>/aufnahme), sofort nach Änderung von masten.json.
 # Jede Abfrage pingt die Box einmal an (Latenzkarte), liest optional Handshake/Zähler des WireGuard-Tunnels und
 # die Datenzähler der Box; bei aktivem Tracking landen auch Fehlschläge in der Datenbank (Funkloch-/Abbruchkarte).
@@ -34,6 +35,8 @@ HALTEN_MAX_S = 300                  # einen unplausiblen Sprung höchstens so la
 PP_FENSTER_S = 120                  # Ping-Pong: ≥ 2 Wechsel zwischen genau zwei Zellen in diesem Fenster
 FREI_MIN_M = 1500                   # BeaconDB/OpenCelliD melden für Einzelzellen oft ±200 m, liegen aber km daneben
 MAST_ABW_M = 800                    # Sektor passt nicht zum eNB-Mast, wenn GPS- und TA-Abstand im Median so weit abweichen
+ABSTAND_M = 150                     # bei Tracking etwa alle so viele Meter abfragen …
+INTERVALL_MIN_S = 5                 # … aber nicht öfter als alle 5 s (und nicht seltener als alle 10 s)
 NACHBAR_MIN_M = 1500                # Genauigkeit, wenn nur andere Sektoren derselben Station bekannt sind (Median 1,0 km)
 OCID_KEY = K["melden"]["opencellid_schluessel"]   # auch zum Nachschlagen genutzt, wenn vorhanden
 BOX_IP = K["box"]["adresse"]
@@ -322,6 +325,17 @@ def aktiv():
     return time.time() - mtime(AUFNAHME) < 120 or load(TRACKING, {}).get("an", False)
 
 
+def intervall():
+    """60 s ohne Tracking; mit Tracking 10 s, bei Fahrt laut Handy-GPS (letzte Minute) etwa alle ABSTAND_M Meter."""
+    if not aktiv():
+        return 60
+    try:
+        v = [r[4] for r in db.gps(int((time.time() - 60) * 1000)) if r[4] is not None]
+    except Exception:
+        v = []
+    return max(INTERVALL_MIN_S, min(10, ABSTAND_M / v[-1])) if v and v[-1] > 0 else 10
+
+
 def loop():
     seen = mtime(MASTEN)
     while True:
@@ -330,12 +344,13 @@ def loop():
             main()
         except Exception as e:
             print("Fehler:", e, flush=True)
+        warten = intervall()
         while True:
             time.sleep(1)
             if mtime(MASTEN) != seen:
                 seen = mtime(MASTEN)
                 break
-            if time.time() - t0 >= (10 if aktiv() else 60):
+            if time.time() - t0 >= warten:
                 break
 
 
