@@ -53,12 +53,25 @@ def position(pts, t):
             "speed": a[4] if a[4] is not None else b[4], "heading": a[5] if a[5] is not None else b[5]}
 
 
+FRISCH_S = 30   # Nachbarzelle gilt als frisch, wenn sich ihr Messwert seit der Abfrage davor (≤ 30 s) geändert hat
+
+
 def paare(seit):
+    """Messpaare (Zeit, Handy-GPS, Zellen) nach seit. Die FRITZ!Box behält Nachbarzellen nach dem Einschalten in der
+    Liste, auch wenn sie sie längst nicht mehr empfängt (Werte bleiben dann bis zu 30 min unverändert, bei einer Fahrt
+    waren 33 von 42 Zellen so eingefroren). Gemeldet werden deshalb nur die verbundene Zelle und Nachbarzellen, die neu
+    in der Liste sind oder deren RSRP/RSRQ sich gegenüber der vorigen Abfrage geändert hat."""
     pts = gps_punkte()
-    out = []
-    for m in db.messungen(seit):
-        pos = position(pts, m["t"])
-        cells = [c for c in m.get("zellen", []) if c.get("typ") == "lte" and c.get("plmn")]
+    out, vorher, t_vorher = [], {}, None
+    for m in db.messungen(max(0, seit - 120)):
+        alle = [c for c in m.get("zellen", []) if c.get("typ") == "lte" and c.get("plmn")]
+        if not alle:
+            continue
+        nah = t_vorher is not None and m["t"] - t_vorher <= FRISCH_S
+        cells = [c for c in alle if c.get("verbunden") == "primary"
+                 or (nah and (c["eci"] not in vorher or vorher[c["eci"]] != (c.get("rsrp"), c.get("rsrq"))))]
+        vorher, t_vorher = {c["eci"]: (c.get("rsrp"), c.get("rsrq")) for c in alle}, m["t"]
+        pos = position(pts, m["t"]) if m["t"] > seit else None
         if pos and cells:
             out.append((m["t"], pos, cells))
     return out
