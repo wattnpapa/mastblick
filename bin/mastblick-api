@@ -29,6 +29,7 @@ AUFNAHME = konfig.datei("aufnahme")     # mtime = letzte GPS-Meldung; mastblick-
 MAX_GEO_ALTER = 600      # Zellinfo darf höchstens 10 min alt sein, sonst passt sie nicht zur Position
 MAX_GENAU = 150          # Browser-Position genauer als 150 m, sonst nutzlos
 MIN_STREUUNG = 100       # Beobachtungen müssen mindestens so weit auseinander liegen
+NAH_FOLGE_S = 30     # Abstand 0 zählt nur, wenn die vorige Messung derselben Station höchstens so alt ist
 NAH_M = 40               # Abstand 0: Mast liegt innerhalb weniger Dutzend Meter
 TA_FAKTOR = 1.2          # Abstand der FRITZ!Box ist zu kurz: echt ≈ 1,2 × gemeldet (Auswertung mit Handy-GPS)
 MAX_ABWEICHUNG = 400     # Ausgleichsrechnung mit größerem Restfehler gilt als unbrauchbar
@@ -193,10 +194,17 @@ def vorschlaege():
         return _VCACHE["d"]
     pts, masten, verw = gps_punkte(), load(MASTEN, {}), set(load(VERWORFEN, []))
     by_enb, by_sek = defaultdict(list), defaultdict(list)
+    vor = None  # (t, eNB, Abstand) der letzten verwertbaren Messung
     for m in db.messungen():
         c = next((z for z in m.get("zellen", []) if z.get("verbunden") == "primary"), None)
         if not c or c.get("distanz_m") is None:
             continue
+        e = f'{c["plmn"]}:{c["enb"]}'
+        # Abstand 0 meldet die Box auch direkt nach dem Zellwechsel, bevor sie den echten Wert kennt.
+        # Glaubhaft ist er nur, wenn sie sich in derselben Station schon auf wenige hundert Meter genähert hat.
+        if c["distanz_m"] == 0 and not (vor and vor[1] == e and m["t"] - vor[0] <= NAH_FOLGE_S and vor[2] <= 300):
+            continue
+        vor = (m["t"], e, c["distanz_m"])
         p = gps_bei(pts, m["t"])
         if p:
             o = {"lat": p[0], "lng": p[1], "distanz_m": c["distanz_m"]}
