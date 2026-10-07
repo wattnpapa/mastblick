@@ -209,7 +209,7 @@ def verfahren_vergleich(ab, bis):
                 fehler[n].append(e)
         punkte.append({"t": t, "gps": [round(p[0], 6), round(p[1], 6)] if p else None, "v": v})
     return {"von": int(ab), "bis": int(bis), "namen": [n for n in VERFAHREN if any(n in q["v"] for q in punkte)],
-            "fingerabdruck_nachgerechnet": bool(nach), "punkte": punkte,
+            "fingerabdruck_nachgerechnet": any(_FPN.get(t) for t in nach), "punkte": punkte,
             "guete": {n: {"n": len(f), "median": _median(f), "p90": _p(f, .9), "ueber_2km": sum(x > 2000 for x in f)}
                       for n, f in fehler.items()}}
 
