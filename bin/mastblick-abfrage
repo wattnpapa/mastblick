@@ -34,6 +34,7 @@ V_MAX = 50                          # m/s: schneller kann die Box nicht unterweg
 HALTEN_MAX_S = 300                  # einen unplausiblen Sprung höchstens so lange ignorieren
 PP_FENSTER_S = 120                  # Ping-Pong: ≥ 2 Wechsel zwischen genau zwei Zellen in diesem Fenster
 FREI_MIN_M = 1500                   # BeaconDB/OpenCelliD melden für Einzelzellen oft ±200 m, liegen aber km daneben
+MAST_FERN_M = 1000                  # weiter vom Mast entfernt: Schwerpunkt anderer Sektoren statt Mast als Ort
 MAST_ABW_M = 800                    # Sektor passt nicht zum eNB-Mast, wenn GPS- und TA-Abstand im Median so weit abweichen
 ABSTAND_M = 150                     # bei Tracking etwa alle so viele Meter abfragen …
 INTERVALL_MIN_S = 5                 # … aber nicht öfter als alle 5 s (und nicht seltener als alle 10 s)
@@ -240,14 +241,22 @@ def main():
     if not mast and base in masten and not ((eigen or {}).get("mast_n", 0) >= 2 and (eigen or {}).get("mast_abw_m", 0) > MAST_ABW_M):
         mast = masten[base]
     nachbarn = [v for k, v in zellen.items() if k.rsplit(":", 1)[0] == base and k != sk and v.get("anzahl", 0) >= MIN_ANZAHL]
+    # Abstand 0 direkt nach dem Wechsel von einer anderen Station: die Box kennt den echten Wert noch nicht
+    dist = prim.get("distanz_m")
+    vorher = (last.get("kurz") or [[0, ""]])[-1][1] if last.get("ok") else ""
+    if dist == 0 and vorher.rsplit(":", 1)[0] != base:
+        dist = None
+    # Mast nur als Ort nehmen, wenn die Box nah dran ist; weit weg (oder Abstand unbekannt) liegt sie irgendwo auf
+    # einem großen Ring, dann ist der Schwerpunkt anderer Sektoren besser (Testfahrt: Mast 1,8 km daneben)
+    mast_nah = dist is not None and dist * TA_FAKTOR <= MAST_FERN_M
     if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
         # eigene Messungen: Schwerpunkt der GPS-Positionen, an denen die Box mit dieser Zelle verbunden war
         geo = {"lat": eigen["lat"], "lng": eigen["lng"], "genauigkeit_m": eigen["streuung_m"], "quelle": "eigene Zelldaten",
                "anzahl": eigen["anzahl"]}
-    elif mast:
+    elif mast and (mast_nah or not nachbarn):
         # Mast bekannt: Box liegt auf einem Ring mit dem gemeldeten Abstand (Timing Advance) um den Mast
-        geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((prim.get("distanz_m") or 230) * TA_FAKTOR),
-               "quelle": "Mastdatenbank", "mast": True, "enb": prim.get("enb"), "distanz_m": prim.get("distanz_m"),
+        geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((dist or 230) * TA_FAKTOR) if dist is not None else FREI_MIN_M,
+               "quelle": "Mastdatenbank", "mast": True, "enb": prim.get("enb"), "distanz_m": dist,
                "sektor": prim.get("sektor") if sk in masten else None}
     elif nachbarn:
         # Sektor neu, aber andere Sektoren derselben Station bekannt: deren Schwerpunkt (gewichtet nach Messungen)
