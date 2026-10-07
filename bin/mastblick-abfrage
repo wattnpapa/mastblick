@@ -34,6 +34,8 @@ V_MAX = 50                          # m/s: schneller kann die Box nicht unterweg
 HALTEN_MAX_S = 300                  # einen unplausiblen Sprung höchstens so lange ignorieren
 PP_FENSTER_S = 120                  # Ping-Pong: ≥ 2 Wechsel zwischen genau zwei Zellen in diesem Fenster
 FREI_MIN_M = 1500                   # BeaconDB/OpenCelliD melden für Einzelzellen oft ±200 m, liegen aber km daneben
+NAH_FOLGE_S = 30                    # kleiner Abstand zählt nur so kurz nach einer glaubhaften Meldung derselben Station
+RING_MIN_M = 300                    # ab diesem Abstand Ort auf dem Ring um den Mast
 MAST_FERN_M = 1000                  # weiter vom Mast entfernt: Schwerpunkt anderer Sektoren statt Mast als Ort
 MAST_ABW_M = 800                    # Sektor passt nicht zum eNB-Mast, wenn GPS- und TA-Abstand im Median so weit abweichen
 ABSTAND_M = 150                     # bei Tracking etwa alle so viele Meter abfragen …
@@ -208,6 +210,15 @@ def wg_info():
     return None, None, None
 
 
+def auf_ring(mast, ziel, r):
+    """Punkt im Abstand r (m) vom Mast in Richtung ziel."""
+    k = math.cos(math.radians(mast["lat"]))
+    dx, dy = (ziel["lng"] - mast["lng"]) * k, ziel["lat"] - mast["lat"]
+    n = math.hypot(dx, dy) or 1e-9
+    f = r / 111200 / n
+    return round(mast["lat"] + dy * f, 6), round(mast["lng"] + dx * f / k, 6)
+
+
 def main():
     os.makedirs(STATE, exist_ok=True)
     now = int(time.time())
@@ -241,18 +252,34 @@ def main():
     if not mast and base in masten and not ((eigen or {}).get("mast_n", 0) >= 2 and (eigen or {}).get("mast_abw_m", 0) > MAST_ABW_M):
         mast = masten[base]
     nachbarn = [v for k, v in zellen.items() if k.rsplit(":", 1)[0] == base and k != sk and v.get("anzahl", 0) >= MIN_ANZAHL]
-    # Abstand 0 direkt nach dem Wechsel von einer anderen Station: die Box kennt den echten Wert noch nicht
+    # Kleine Abstände (0/150 m) meldet die Box auch nach einem Zellwechsel oder zwischendurch in großen Zellen,
+    # obwohl sie km entfernt ist (Testfahrt: „150 m“ bei 4,8 km). Glaubhaft nur nach schrittweiser Annäherung:
+    # die letzte glaubhafte Meldung derselben Station ist höchstens NAH_FOLGE_S alt und ergab ≤ 450 m.
     dist = prim.get("distanz_m")
-    vorher = (last.get("kurz") or [[0, ""]])[-1][1] if last.get("ok") else ""
-    if dist == 0 and vorher.rsplit(":", 1)[0] != base:
+    vt = last.get("abstand") if last.get("ok") else None   # [t, Station, Abstand] der letzten glaubhaften Meldung
+    if dist is not None and dist <= 150 and not (vt and vt[1] == base and now - vt[0] <= NAH_FOLGE_S and vt[2] <= 450):
         dist = None
+    abstand = [now, base, dist] if dist is not None else (vt if vt and now - vt[0] <= NAH_FOLGE_S else None)
     # Mast nur als Ort nehmen, wenn die Box nah dran ist; weit weg (oder Abstand unbekannt) liegt sie irgendwo auf
     # einem großen Ring, dann ist der Schwerpunkt anderer Sektoren besser (Testfahrt: Mast 1,8 km daneben)
     mast_nah = dist is not None and dist * TA_FAKTOR <= MAST_FERN_M
-    if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
+    ring_r = dist * TA_FAKTOR if dist is not None and dist >= RING_MIN_M else None
+    if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL and mast and ring_r:
+        # Mast und Abstand bekannt: Punkt auf dem Ring um den Mast in Richtung des eigenen Zellschwerpunkts
+        # (Auswertung aller Fahrten: Median 410 statt 490 m, p90 1,5 statt 2,3 km)
+        lat, lng = auf_ring(mast, eigen, ring_r)
+        geo = {"lat": lat, "lng": lng, "genauigkeit_m": max(RING_MIN_M, round(ring_r / 2)), "quelle": "eigene Zelldaten",
+               "anzahl": eigen["anzahl"], "ring_m": round(ring_r)}
+    elif eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
         # eigene Messungen: Schwerpunkt der GPS-Positionen, an denen die Box mit dieser Zelle verbunden war
         geo = {"lat": eigen["lat"], "lng": eigen["lng"], "genauigkeit_m": eigen["streuung_m"], "quelle": "eigene Zelldaten",
                "anzahl": eigen["anzahl"]}
+    elif mast and ring_r and (last.get("geo") or {}).get("lat") is not None and last.get("ok") and now - last.get("abgefragt", 0) <= 60:
+        # weit vom Mast, Sektor noch ohne eigene Daten: auf dem Ring in Richtung des letzten Orts bleiben; der Schwerpunkt
+        # anderer Sektoren liegt bei großen Landzellen auf der falschen Seite (Testfahrt: 5–7 km daneben)
+        lat, lng = auf_ring(mast, last["geo"], ring_r)
+        geo = {"lat": lat, "lng": lng, "genauigkeit_m": max(RING_MIN_M, round(ring_r * 0.7)), "quelle": "Mastdatenbank",
+               "mast": False, "enb": prim.get("enb"), "distanz_m": dist, "ring_m": round(ring_r)}
     elif mast and (mast_nah or not nachbarn):
         # Mast bekannt: Box liegt auf einem Ring mit dem gemeldeten Abstand (Timing Advance) um den Mast
         geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((dist or 230) * TA_FAKTOR) if dist is not None else FREI_MIN_M,
@@ -297,13 +324,13 @@ def main():
         d = math.hypot((a[3] - b[3]) * 111320 * math.cos(math.radians(a[2])), (a[2] - b[2]) * 110540)
         geo = {**geo, "lat": round((a[2] + b[2]) / 2, 6), "lng": round((a[3] + b[3]) / 2, 6),
                "genauigkeit_m": round(max(a[4], b[4]) + d / 2), "pingpong": [a[1], b[1]]}
-    # Plausibilität: Sprung weiter als seit dem letzten angenommenen Ort fahrbar und die neue Quelle ist nur eine fremde
-    # Schätzung (BeaconDB, OpenCelliD, Schwerpunkt anderer Sektoren – Sektoren einer Station reichen teils 10 km weit
-    # auseinander) → alten Ort halten. Fahrbare Strecke ab ort_seit rechnen, nicht ab der letzten Abfrage: sonst gilt beim
+    # Plausibilität: Sprung weiter als seit dem letzten angenommenen Ort fahrbar (V_MAX plus beide Genauigkeiten)
+    # → alten Ort halten. Gilt für alle Quellen: auch eigene Zelldaten und Mast springen bei großen Landzellen,
+    # falschen Abständen der Box oder Sektoren, die 10 km auseinanderliegen, unmöglich weit. Fahrbare Strecke ab ort_seit rechnen, nicht ab der letzten Abfrage: sonst gilt beim
     # Fahren jede neue Schätzung als Sprung und der Ort klebt jeweils HALTEN_MAX_S fest (bei einer Testfahrt bis 10 km daneben).
     lg = last.get("geo") or {}
     if (geo and geo.get("lat") is not None and lg.get("lat") is not None and last.get("ok")
-            and geo.get("quelle") in ("BeaconDB", "OpenCelliD", "eigene Zelldaten (andere Sektoren)") and now - last.get("abgefragt", now) < 600):
+            and now - last.get("abgefragt", now) < 600):
         sprung = math.hypot((geo["lng"] - lg["lng"]) * 111320 * math.cos(math.radians(lg["lat"])), (geo["lat"] - lg["lat"]) * 110540)
         erlaubt = (V_MAX * max(10, now - last.get("ort_seit", now)) + 500
                    + min(lg.get("genauigkeit_m") or 0, 2000) + min(geo.get("genauigkeit_m") or 0, 2000))
@@ -312,7 +339,7 @@ def main():
                    "verworfen": {"quelle": geo["quelle"], "sprung_m": round(sprung)}}
     p = prim
     out = {"ok": True, "fehler": None, "abgefragt": now, "technik": info["technik"],
-           "rsrp_antennen": info["rsrp_antennen"], "zellen": info["zellen"], "geo": geo, "kurz": kurz[-30:]}
+           "rsrp_antennen": info["rsrp_antennen"], "zellen": info["zellen"], "geo": geo, "kurz": kurz[-30:], "abstand": abstand}
     # beim Halten zählt die Haltezeit ab dem letzten angenommenen Ort weiter (sonst liefe HALTEN_MAX_S nie ab)
     out["ort_seit"] = last.get("ort_seit", now) if (last.get("geo") == geo or (geo or {}).get("gehalten")) else now
     write_json(OUT, out)

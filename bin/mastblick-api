@@ -200,9 +200,9 @@ def vorschlaege():
         if not c or c.get("distanz_m") is None:
             continue
         e = f'{c["plmn"]}:{c["enb"]}'
-        # Abstand 0 meldet die Box auch direkt nach dem Zellwechsel, bevor sie den echten Wert kennt.
-        # Glaubhaft ist er nur, wenn sie sich in derselben Station schon auf wenige hundert Meter genähert hat.
-        if c["distanz_m"] == 0 and not (vor and vor[1] == e and m["t"] - vor[0] <= NAH_FOLGE_S and vor[2] <= 300):
+        # Kleine Abstände (0/150 m) meldet die Box auch nach dem Zellwechsel oder zwischendurch, obwohl sie km entfernt ist.
+        # Glaubhaft nur, wenn die letzte glaubhafte Meldung derselben Station kurz davor lag und ≤ 450 m ergab.
+        if c["distanz_m"] <= 150 and not (vor and vor[1] == e and m["t"] - vor[0] <= NAH_FOLGE_S and vor[2] <= 450):
             continue
         vor = (m["t"], e, c["distanz_m"])
         p = gps_bei(pts, m["t"])
