@@ -2,6 +2,7 @@
 #   abfrage  eine Zeile je TR-064-Abfrage: Erfolg/Fehler, Ping, Tunnel, Einschaltzeit, Datenzähler, angezeigter Ort
 #   zelle    alle Zellen je Abfrage (nr 0 = primäre Zelle, wie von der Box sortiert)
 #   gps      Handy-Positionen (Browser, OwnTracks)
+#   verfahren  je Abfrage das Ergebnis jedes Ortungsverfahrens (auch der nicht angezeigten), zum Vergleich mit GPS
 # Alle Dienste laufen als Benutzer mastblick; WAL erlaubt Lesen, während geschrieben wird.
 # Lesefunktionen liefern einfache Formen: Messung als dict {t, technik, zellen, …}, Verlauf als Spaltenliste
 # (zeit, plmn, tac, eci, cellid, pci, rsrp, rsrq, distanz_m, lat, lng, genauigkeit_m, quelle) als Text.
@@ -21,6 +22,9 @@ CREATE TABLE IF NOT EXISTS zelle (
 CREATE INDEX IF NOT EXISTS zelle_eci ON zelle (eci);
 CREATE TABLE IF NOT EXISTS gps (
   t_ms INTEGER PRIMARY KEY, lat REAL NOT NULL, lng REAL NOT NULL, acc REAL, speed REAL, heading REAL, quelle TEXT);
+CREATE TABLE IF NOT EXISTS verfahren (
+  t INTEGER NOT NULL, name TEXT NOT NULL, lat REAL NOT NULL, lng REAL NOT NULL, genauigkeit_m INTEGER,
+  PRIMARY KEY (t, name)) WITHOUT ROWID;
 """
 
 
@@ -54,6 +58,13 @@ def abfrage_schreiben(t, technik, zellen, rtt=None, wg_s=None, boot=None, box_b=
     _mit(f)
 
 
+def verfahren_schreiben(t, ergebnisse):
+    """ergebnisse: {name: {lat, lng, genauigkeit_m}}; Verfahren ohne Ergebnis fehlen einfach."""
+    _mit(lambda con: con.executemany("INSERT OR REPLACE INTO verfahren VALUES (?,?,?,?,?)",
+                                     [(t, n, g["lat"], g["lng"], g.get("genauigkeit_m")) for n, g in ergebnisse.items()
+                                      if g and g.get("lat") is not None]))
+
+
 def fehler_schreiben(t, fehler, rtt=None, wg_s=None):
     _mit(lambda con: con.execute("INSERT OR REPLACE INTO abfrage (t, ok, fehler, rtt, wg_s) VALUES (?,0,?,?,?)",
                                  (t, fehler, rtt, wg_s)))
@@ -71,6 +82,7 @@ def aufraeumen(tage=KEEP_DAYS):
         con.execute("DELETE FROM zelle WHERE t < ?", (grenze,))
         con.execute("DELETE FROM abfrage WHERE t < ?", (grenze,))
         con.execute("DELETE FROM gps WHERE t_ms < ?", (grenze * 1000,))
+        con.execute("DELETE FROM verfahren WHERE t < ?", (grenze,))
     _mit(f)
 
 
@@ -111,3 +123,10 @@ def gps(seit_ms=0, bis_ms=None):
     bis_ms = bis_ms if bis_ms is not None else 2 ** 50
     return _mit(lambda con: con.execute("SELECT t_ms, lat, lng, acc, speed, heading, quelle FROM gps "
                                         "WHERE t_ms > ? AND t_ms <= ? ORDER BY t_ms", (seit_ms, bis_ms)).fetchall())
+
+
+def verfahren(ab=0, bis=None):
+    """Ergebnisse der Ortungsverfahren (t, name, lat, lng, genauigkeit_m) mit ab ≤ t ≤ bis, zeitlich sortiert."""
+    bis = bis if bis is not None else 2 ** 40
+    return _mit(lambda con: con.execute("SELECT t, name, lat, lng, genauigkeit_m FROM verfahren WHERE t >= ? AND t <= ? "
+                                        "ORDER BY t", (ab, bis)).fetchall())

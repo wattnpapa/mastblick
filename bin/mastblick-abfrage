@@ -14,7 +14,7 @@
 import json, math, os, re, html, subprocess, time, urllib.request, urllib.error
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "..", "lib")))
-from mastblick import db, konfig
+from mastblick import db, konfig, ortung
 
 K = konfig.K
 STATE = konfig.DATEN
@@ -219,6 +219,36 @@ def auf_ring(mast, ziel, r):
     return round(mast["lat"] + dy * f, 6), round(mast["lng"] + dx * f / k, 6)
 
 
+def verfahren(prim, eigen, mast, dist, ring_r, nachbarn, last, now, geo, hit, zellen):
+    """Alle Ortungsverfahren nebeneinander, unabhängig davon, welches angezeigt wird (Vergleich mit Handy-GPS
+    in der Karte und Auswertung). Ein Verfahren ohne Ergebnis fehlt."""
+    v = {}
+    if eigen and eigen.get("anzahl", 0) >= MIN_ANZAHL:
+        v["schwerpunkt"] = {"lat": eigen["lat"], "lng": eigen["lng"], "genauigkeit_m": eigen["streuung_m"]}
+    if mast:
+        v["mast"] = {"lat": mast["lat"], "lng": mast["lng"],
+                     "genauigkeit_m": round((dist or 230) * TA_FAKTOR) if dist is not None else FREI_MIN_M}
+        lg = last.get("geo") or {}
+        ziel = v.get("schwerpunkt") or (lg if lg.get("lat") is not None and last.get("ok") and now - last.get("abgefragt", 0) <= 60 else None)
+        if ring_r and ziel:
+            lat, lng = auf_ring(mast, ziel, ring_r)
+            v["ring"] = {"lat": lat, "lng": lng, "genauigkeit_m": max(RING_MIN_M, round(ring_r / 2))}
+    if nachbarn:
+        n = sum(x["anzahl"] for x in nachbarn)
+        v["sektoren"] = {"lat": round(sum(x["lat"] * x["anzahl"] for x in nachbarn) / n, 6),
+                         "lng": round(sum(x["lng"] * x["anzahl"] for x in nachbarn) / n, 6), "genauigkeit_m": NACHBAR_MIN_M}
+    try:
+        fa = ortung.fingerabdruck(zellen)
+        if fa:
+            v["fingerabdruck"] = fa
+    except Exception as e:
+        print("Fingerabdruck:", e, flush=True)
+    frei = geo if (geo or {}).get("quelle") in ("BeaconDB", "OpenCelliD") else (hit["geo"] if hit and now - hit["zeit"] < CACHE_TTL else None)
+    if frei and frei.get("lat") is not None:
+        v["frei"] = {"lat": frei["lat"], "lng": frei["lng"], "genauigkeit_m": max(frei.get("genauigkeit_m") or 0, FREI_MIN_M)}
+    return v
+
+
 def main():
     os.makedirs(STATE, exist_ok=True)
     now = int(time.time())
@@ -311,6 +341,7 @@ def main():
             write_json(CACHE, cache)
     if geo and geo.get("quelle") in ("BeaconDB", "OpenCelliD") and geo.get("genauigkeit_m") is not None:
         geo = {**geo, "genauigkeit_m": max(geo["genauigkeit_m"], FREI_MIN_M)}
+    verf = verfahren(prim, eigen, mast, dist, ring_r, nachbarn, last, now, geo, hit, info["zellen"])
     # Ping-Pong-Glättung: springt die Box binnen PP_FENSTER_S nur zwischen zwei Zellen hin und her (Hälfte aller
     # Zellwechsel bei Testfahrten), liegt sie zwischen beiden → Mittelpunkt statt Hin- und Herspringen
     kurz = [k for k in last.get("kurz", []) if now - k[0] <= PP_FENSTER_S] if last.get("ok") else []
@@ -346,6 +377,10 @@ def main():
     # Datenmengen: box = Mobilfunk-WAN der Box seit Einschalten, wg = Tunnel-Zähler am Server
     db.abfrage_schreiben(now, info["technik"], info["zellen"], rtt, wg, einschaltzeit(), box_bytes(),
                               [wg_rx, wg_tx] if wg_rx is not None else None, geo)
+    try:
+        db.verfahren_schreiben(now, {**verf, "angezeigt": geo})
+    except Exception as e:
+        print("Verfahren nicht gespeichert:", e, flush=True)
     if not last.get("ok") or (last.get("zellen") or [{}])[0].get("cellid") != p.get("cellid"):
         print(json.dumps({"zelle": p.get("cellid"), "tac": p.get("tac"), "geo": geo}, ensure_ascii=False), flush=True)
 

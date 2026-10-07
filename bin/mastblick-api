@@ -13,7 +13,7 @@ import base64, hashlib, hmac, json, math, os, queue, threading, time
 from collections import defaultdict
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.environ.get("MASTBLICK_LIB", _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "..", "lib")))
-from mastblick import db, konfig
+from mastblick import db, konfig, ortung
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 K = konfig.K
@@ -165,6 +165,53 @@ def verlauf(ab, bis):
             "gps": gps[::step],
             "strecken": [{"name": s["name"], "quelle": s["quelle"], "punkte": [q[1:] for q in s["punkte"] if ab <= q[0] <= bis]}
                          for s in load(STRECKEN, []) if any(ab <= q[0] <= bis for q in s["punkte"])]}
+
+
+_FPN = {}   # nachgerechneter Fingerabdruck je Abfragezeit (die Karte lädt den Track bei Fahrt alle 10 s)
+VERFAHREN = ("angezeigt", "schwerpunkt", "ring", "fingerabdruck", "mast", "sektoren", "frei")
+
+
+def verfahren_vergleich(ab, bis):
+    """Ergebnis jedes Ortungsverfahrens je Abfrage samt Abstand zum Handy-GPS, dazu Median/p90 je Verfahren.
+    Ältere Abfragen (vor dem Mitspeichern) haben nur „angezeigt“; für sie wird der Fingerabdruck nachgerechnet,
+    nur aus Messungen, die mindestens 10 min älter sind."""
+    pts = gps_punkte()
+    zeilen = defaultdict(dict)
+    for t, n, la, ln, acc in db.verfahren(int(ab), int(bis)):
+        zeilen[t][n] = (la, ln, acc)
+    nach = []
+    for c in db.verlauf(int(ab), int(bis)):
+        t = int(c[0])
+        if c[9] and c[10] and "angezeigt" not in zeilen[t]:
+            zeilen[t]["angezeigt"] = (float(c[9]), float(c[10]), int(float(c[11] or 0)))
+        if "fingerabdruck" not in zeilen[t]:
+            nach.append(t)
+    offen = [t for t in nach if t not in _FPN]
+    if offen:
+        idx = ortung.index()
+        for m in db.messungen(min(offen) - 1, max(offen)):
+            if m["t"] in zeilen and m["t"] not in _FPN and m.get("zellen"):
+                fa = ortung.fingerabdruck(m["zellen"], idx, vor=m["t"])
+                _FPN[m["t"]] = (fa["lat"], fa["lng"], fa["genauigkeit_m"]) if fa else None
+        if len(_FPN) > 50000:
+            _FPN.clear()
+    for t in nach:
+        if _FPN.get(t):
+            zeilen[t]["fingerabdruck"] = _FPN[t]
+    punkte, fehler = [], defaultdict(list)
+    for t in sorted(zeilen):
+        p = gps_bei(pts, t)
+        v = {}
+        for n, (la, ln, acc) in zeilen[t].items():
+            e = round(_m(p[0], p[1], la, ln)) if p else None
+            v[n] = [round(la, 6), round(ln, 6), acc, e]
+            if e is not None:
+                fehler[n].append(e)
+        punkte.append({"t": t, "gps": [round(p[0], 6), round(p[1], 6)] if p else None, "v": v})
+    return {"von": int(ab), "bis": int(bis), "namen": [n for n in VERFAHREN if any(n in q["v"] for q in punkte)],
+            "fingerabdruck_nachgerechnet": bool(nach), "punkte": punkte,
+            "guete": {n: {"n": len(f), "median": _median(f), "p90": _p(f, .9), "ueber_2km": sum(x > 2000 for x in f)}
+                      for n, f in fehler.items()}}
 
 
 def gps_punkte():
@@ -671,6 +718,14 @@ class H(BaseHTTPRequestHandler):
                 h = int(a["h"]) if a.get("h", "").isdigit() and 0 < int(a["h"]) <= 72 else 2
                 von, bis = time.time() - h * 3600, time.time() + 60
             return self.send(200, verlauf(von, min(bis, von + 72 * 3600)))
+        if p == "/api/mast/verfahren":
+            a = dict(x.split("=", 1) for x in q.split("&") if "=" in x)
+            if a.get("von", "").isdigit():
+                von = int(a["von"]); bis = int(a["bis"]) if a.get("bis", "").isdigit() else von + 7200
+            else:
+                h = int(a["h"]) if a.get("h", "").isdigit() and 0 < int(a["h"]) <= 72 else 2
+                von, bis = time.time() - h * 3600, time.time() + 60
+            return self.send(200, verfahren_vergleich(von, min(bis, von + 24 * 3600)))
         if p == "/api/mast/abschnitte":
             return self.send(200, abschnitte())
         if p == "/api/mast/abdeckung":
