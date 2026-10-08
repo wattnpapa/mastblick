@@ -7,7 +7,8 @@ Mit der Zeit wird die Ortung von selbst besser: Läuft beim Fahren das Handy mit
 ## Was es kann
 
 - **Ortung über die Zelle**: fragt die Box per TR-064 (`X_AVM-DE_WANMobileConnection#GetInfoEx`) nach allen sichtbaren Zellen mit Signalstärke und Abstand (Timing Advance)
-  - Reihenfolge der Quellen: eigene Zelldatenbank → eigene Mastdatenbank → BeaconDB / OpenCelliD
+  - Reihenfolge der Quellen: Ring um einen bekannten Mast (gemeldeter Abstand, Richtung eigener Zelldaten) → Fingerabdruck (Signalstärken der primären und Nachbarzellen gegen frühere Messungen) → eigene Zelldatenbank → eigene Mastdatenbank → BeaconDB / OpenCelliD → andere Sektoren derselben Station
+  - Alle Verfahren werden bei jeder Abfrage mitgerechnet und gespeichert; die Karte zeigt sie zum Vergleich mit dem Handy-GPS
   - Plausibilitätsfilter gegen Ausreißer und Glättung bei Ping-Pong zwischen zwei Zellen
 - **Karte** (Leaflet, OpenStreetMap)
   - Box mit Genauigkeitskreis, bekannte Masten, laufende Linie zum gerade verbundenen Mast

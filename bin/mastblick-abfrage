@@ -315,14 +315,7 @@ def main():
         geo = {"lat": mast["lat"], "lng": mast["lng"], "genauigkeit_m": round((dist or 230) * TA_FAKTOR) if dist is not None else FREI_MIN_M,
                "quelle": "Mastdatenbank", "mast": True, "enb": prim.get("enb"), "distanz_m": dist,
                "sektor": prim.get("sektor") if sk in masten else None}
-    elif nachbarn:
-        # Sektor neu, aber andere Sektoren derselben Station bekannt: deren Schwerpunkt (gewichtet nach Messungen)
-        n = sum(v["anzahl"] for v in nachbarn)
-        geo = {"lat": round(sum(v["lat"] * v["anzahl"] for v in nachbarn) / n, 6),
-               "lng": round(sum(v["lng"] * v["anzahl"] for v in nachbarn) / n, 6),
-               "genauigkeit_m": max(NACHBAR_MIN_M, max(v["streuung_m"] for v in nachbarn)),
-               "quelle": "eigene Zelldaten (andere Sektoren)", "anzahl": n}
-    elif hit and now - hit["zeit"] < CACHE_TTL:
+    elif hit and now - hit["zeit"] < CACHE_TTL and (hit["geo"] or {}).get("lat") is not None:
         geo = hit["geo"]
     else:
         kand = []
@@ -337,11 +330,25 @@ def main():
         geo = min(treffer, key=lambda g: g["genauigkeit_m"]) if treffer else (kand[0] if kand else last.get("geo"))
         if kand:
             cache[key] = {"zeit": now, "geo": geo}
+        if not treffer and nachbarn:
+            # Schwerpunkt anderer Sektoren derselben Station erst nach BeaconDB/OpenCelliD: Auswertung 08.10.
+            # 1,7 km Median, schlechtestes aller Verfahren (freie Daten 0,9 km)
+            n = sum(v["anzahl"] for v in nachbarn)
+            geo = {"lat": round(sum(v["lat"] * v["anzahl"] for v in nachbarn) / n, 6),
+                   "lng": round(sum(v["lng"] * v["anzahl"] for v in nachbarn) / n, 6),
+                   "genauigkeit_m": max(NACHBAR_MIN_M, max(v["streuung_m"] for v in nachbarn)),
+                   "quelle": "eigene Zelldaten (andere Sektoren)", "anzahl": n}
             cache = {k: v for k, v in cache.items() if now - v["zeit"] < 7 * 86400}
             write_json(CACHE, cache)
     if geo and geo.get("quelle") in ("BeaconDB", "OpenCelliD") and geo.get("genauigkeit_m") is not None:
         geo = {**geo, "genauigkeit_m": max(geo["genauigkeit_m"], FREI_MIN_M)}
     verf = verfahren(prim, eigen, mast, dist, ring_r, nachbarn, last, now, geo, hit, info["zellen"])
+    # Angezeigt: Ring um den Mast, sonst Fingerabdruck, sonst die Kette oben. Auswertung 08.10. (1135 Abfragen mit GPS):
+    # Ring 440 m Median und nie über 2 km, Fingerabdruck 402 m, Zellschwerpunkt 528 m, bisherige Anzeige 647 m
+    if "ring" in verf:
+        geo = {**verf["ring"], "quelle": "Ring um den Mast", "enb": prim.get("enb"), "distanz_m": dist}
+    elif "fingerabdruck" in verf:
+        geo = verf["fingerabdruck"]
     # Ping-Pong-Glättung: springt die Box binnen PP_FENSTER_S nur zwischen zwei Zellen hin und her (Hälfte aller
     # Zellwechsel bei Testfahrten), liegt sie zwischen beiden → Mittelpunkt statt Hin- und Herspringen
     kurz = [k for k in last.get("kurz", []) if now - k[0] <= PP_FENSTER_S] if last.get("ok") else []
